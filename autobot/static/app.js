@@ -57,15 +57,16 @@ const memoryList = $('#memory-list');
     const resp = await fetch(`${API}/api/scenarios`);
     const data = await resp.json();
     llmAvailable = data.llm_available;
+    const llmUrl = data.llm_url || 'http://localhost:1234/v1';
     if (llmAvailable) {
       llmStatus.className = 'llm-status connected';
-      llmStatus.textContent = 'ANTHROPIC_API_KEY detected — Claude LLM brain is available';
+      llmStatus.textContent = `Local LLM ready — pointing at ${llmUrl}`;
       modeLlm.checked = true;
     } else {
       llmStatus.className = 'llm-status disconnected';
       llmStatus.innerHTML =
-        'No ANTHROPIC_API_KEY found — set it to enable Claude LLM brain<br>' +
-        '<small>export ANTHROPIC_API_KEY=sk-ant-... then restart the server</small>';
+        'openai package not installed — needed for local LLM<br>' +
+        '<small>pip install openai &mdash; then restart the server</small>';
       modeRules.checked = true;
     }
   } catch {

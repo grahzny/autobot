@@ -63,10 +63,17 @@ async def index():
 
 @app.get("/api/scenarios")
 async def list_scenarios():
-    has_key = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+    # Check if the openai package is available and LLM endpoint is configured
+    llm_url = os.environ.get("AUTOBOT_LLM_URL", "http://localhost:1234/v1")
+    try:
+        from openai import OpenAI
+        llm_available = True
+    except ImportError:
+        llm_available = False
     return {
         "scenarios": list(ALL_SCENARIOS.keys()),
-        "llm_available": has_key,
+        "llm_available": llm_available,
+        "llm_url": llm_url,
     }
 
 

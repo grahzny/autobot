@@ -4,10 +4,14 @@ The LLM reads the world observation, interprets events, reasons about
 its emotional state, retrieves relevant memories, and produces a
 chain-of-thought inner monologue before deciding on an action.
 
-Requires: ANTHROPIC_API_KEY environment variable.
-Optional: AUTOBOT_MODEL (defaults to claude-sonnet-4-5-20250929)
+Uses an OpenAI-compatible API (LM Studio, ollama, vLLM, etc.).
 
-Without an API key, falls back to the rule-based policy (demo mode only).
+Configuration via environment variables:
+  AUTOBOT_LLM_URL   — API base URL (default: http://localhost:1234/v1)
+  AUTOBOT_MODEL     — model name (default: use whatever is loaded in LM Studio)
+  AUTOBOT_API_KEY   — API key if required (default: lm-studio, i.e. none needed)
+
+Without a reachable LLM server, falls back to the rule-based policy (demo mode).
 """
 
 from __future__ import annotations
@@ -100,6 +104,11 @@ Cognitive (cost: small energy, NO attention):
 """
 
 
+# Default LM Studio endpoint
+DEFAULT_LLM_URL = "http://localhost:1234/v1"
+DEFAULT_API_KEY = "lm-studio"  # LM Studio doesn't need a real key
+
+
 @dataclass
 class AgentDecision:
     """The result of the agent's thinking + action selection."""
@@ -107,6 +116,14 @@ class AgentDecision:
     action: dict[str, Any] # the action to execute
     used_llm: bool         # whether the LLM was used or fell back to rules
     raw_response: str = "" # the raw LLM response (for debugging)
+
+
+def _get_llm_config() -> tuple[str, str, str]:
+    """Return (base_url, api_key, model) from env vars."""
+    base_url = os.environ.get("AUTOBOT_LLM_URL", DEFAULT_LLM_URL)
+    api_key = os.environ.get("AUTOBOT_API_KEY", DEFAULT_API_KEY)
+    model = os.environ.get("AUTOBOT_MODEL", "")
+    return base_url, api_key, model
 
 
 def decide(
@@ -120,7 +137,7 @@ def decide(
     use_llm: bool = True,
 ) -> AgentDecision:
     """
-    The agent's decision process. Calls the LLM for real thinking,
+    The agent's decision process. Calls the local LLM for real thinking,
     falls back to rule-based policy in demo mode.
     """
     if not use_llm:
@@ -132,46 +149,44 @@ def decide(
             thinking=thinking, action=action, used_llm=False,
         )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        action = rule_based_decide(
-            ws, emotions, affect, goal_engine, memory, observation,
-        )
-        thinking = (
-            "[NO API KEY — running in demo mode with rule-based policy] "
-            + _generate_rule_based_thinking(action, emotions, affect, goal_engine)
-        )
-        return AgentDecision(
-            thinking=thinking, action=action, used_llm=False,
-        )
-
     try:
-        import anthropic
+        from openai import OpenAI
     except ImportError:
         action = rule_based_decide(
             ws, emotions, affect, goal_engine, memory, observation,
         )
         thinking = (
-            "[anthropic package not installed — running in demo mode] "
+            "[openai package not installed — pip install openai] "
             + _generate_rule_based_thinking(action, emotions, affect, goal_engine)
         )
         return AgentDecision(
             thinking=thinking, action=action, used_llm=False,
         )
 
-    # --- Real LLM call ---
+    # --- Real LLM call via OpenAI-compatible API ---
+    base_url, api_key, model = _get_llm_config()
+
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        model = os.environ.get("AUTOBOT_MODEL", "claude-sonnet-4-5-20250929")
+        client = OpenAI(base_url=base_url, api_key=api_key)
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=800,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": agent_prompt}],
-        )
+        # Build kwargs — omit model if not set (LM Studio uses whatever is loaded)
+        kwargs: dict[str, Any] = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": agent_prompt},
+            ],
+            "max_tokens": 800,
+            "temperature": 0.7,
+        }
+        if model:
+            kwargs["model"] = model
+        else:
+            # LM Studio requires a model field but ignores the value
+            kwargs["model"] = "local-model"
 
-        raw = response.content[0].text.strip()
+        response = client.chat.completions.create(**kwargs)
+
+        raw = response.choices[0].message.content.strip()
         parsed = _parse_response(raw)
 
         if parsed:

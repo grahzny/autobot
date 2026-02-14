@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-llm = ["anthropic>=0.30.0"]
+llm = ["openai>=1.0.0"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
