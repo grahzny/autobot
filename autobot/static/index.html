@@ -13,6 +13,9 @@
       <div class="start-container">
         <h1 class="logo">AUTOBOT</h1>
         <p class="subtitle">AI World Model — Logic &amp; Language Environment</p>
+
+        <div id="llm-status" class="llm-status"></div>
+
         <div class="scenario-grid">
           <button class="scenario-card" data-scenario="broken_promise">
             <span class="scenario-icon">💔</span>
@@ -41,9 +44,19 @@
           </button>
         </div>
         <div class="start-options">
-          <label class="toggle-label">
-            <input type="checkbox" id="use-llm-toggle">
-            <span>Use Claude LLM (requires ANTHROPIC_API_KEY)</span>
+          <label class="mode-selector">
+            <input type="radio" name="agent-mode" value="llm" id="mode-llm" checked>
+            <span class="mode-label">
+              <b>Claude LLM Brain</b>
+              <small>Real thinking, chain-of-thought reasoning, interprets events</small>
+            </span>
+          </label>
+          <label class="mode-selector">
+            <input type="radio" name="agent-mode" value="rules" id="mode-rules">
+            <span class="mode-label">
+              <b>Demo Mode (Rule-Based)</b>
+              <small>No API key needed — deterministic policy with synthetic thoughts</small>
+            </span>
           </label>
         </div>
       </div>
@@ -53,8 +66,9 @@
     <div id="sim-screen" class="screen">
       <header class="sim-header">
         <div class="header-left">
-          <button id="back-btn" class="btn-icon" title="Back to scenarios">←</button>
+          <button id="back-btn" class="btn-icon" title="Back to scenarios">&#8592;</button>
           <h2 id="scenario-title"></h2>
+          <span id="mode-badge" class="mode-badge">LLM</span>
         </div>
         <div class="header-center">
           <span id="time-display" class="time-badge">Day 1, 08:00</span>
@@ -100,8 +114,13 @@
           <div id="salience-tags" class="tag-list"></div>
         </section>
 
-        <!-- Center Column: Event Feed -->
+        <!-- Center Column: Thinking + Event Feed -->
         <section class="panel feed-panel">
+          <h3>Agent's Inner Monologue</h3>
+          <div id="thinking-display" class="thinking-display">
+            <p class="thinking-placeholder">The agent's thoughts will appear here...</p>
+          </div>
+
           <h3>Event Feed</h3>
           <div id="event-feed" class="event-feed"></div>
         </section>

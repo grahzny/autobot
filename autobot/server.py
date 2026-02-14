@@ -12,10 +12,9 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from autobot.agent_policy import decide_action as rule_based_decide
 from autobot.emotions import AffectState
 from autobot.engine import WorldEngine
-from autobot.llm_agent import decide_action_llm
+from autobot.llm_agent import decide
 from autobot.observation import build_observation
 from autobot.scenarios import ALL_SCENARIOS
 
@@ -38,18 +37,18 @@ _sessions: dict[str, dict[str, Any]] = {}
 
 class StartRequest(BaseModel):
     scenario: str
-    use_llm: bool = False
+    use_llm: bool = True
 
 
 class ActionRequest(BaseModel):
     session_id: str
-    action: dict[str, Any] | None = None  # None = let agent decide
+    action: dict[str, Any] | None = None
 
 
 class StepRequest(BaseModel):
     session_id: str
     steps: int = 1
-    use_llm: bool = False
+    use_llm: bool = True
 
 
 # ---- Routes ----
@@ -64,7 +63,11 @@ async def index():
 
 @app.get("/api/scenarios")
 async def list_scenarios():
-    return {"scenarios": list(ALL_SCENARIOS.keys())}
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+    return {
+        "scenarios": list(ALL_SCENARIOS.keys()),
+        "llm_available": has_key,
+    }
 
 
 @app.post("/api/start")
@@ -81,7 +84,6 @@ async def start_simulation(req: StartRequest):
         "history": [],
     }
 
-    # Return initial state
     obs = build_observation(engine.world, [])
     return {
         "session_id": session_id,
@@ -101,66 +103,30 @@ async def step_simulation(req: StepRequest):
         raise HTTPException(404, "Session not found")
 
     engine: WorldEngine = session["engine"]
-    use_llm = req.use_llm or session["use_llm"]
+    use_llm = req.use_llm
     results = []
 
     for _ in range(req.steps):
-        # Agent decides
+        # Build the observation and agent prompt BEFORE ticking
         obs = build_observation(engine.world, [])
-        if use_llm:
-            action = decide_action_llm(
-                ws=engine.world,
-                emotions=engine.emotions,
-                affect=AffectState(),
-                goal_engine=engine.goal_engine,
-                memory=engine.memory,
-                observation=obs,
-                agent_prompt=engine._compose_prompt(obs, AffectState()),
-            )
-        else:
-            action = rule_based_decide(
-                ws=engine.world,
-                emotions=engine.emotions,
-                affect=AffectState(),
-                goal_engine=engine.goal_engine,
-                memory=engine.memory,
-                observation=obs,
-            )
+        prompt = engine._compose_prompt(obs, AffectState())
 
-        # Tick the world
-        result = engine.tick(agent_action=action)
+        # Agent thinks and decides
+        decision = decide(
+            ws=engine.world,
+            emotions=engine.emotions,
+            affect=AffectState(),
+            goal_engine=engine.goal_engine,
+            memory=engine.memory,
+            observation=obs,
+            agent_prompt=prompt,
+            use_llm=use_llm,
+        )
 
-        step_data = {
-            "cycle": engine.cycle_count,
-            "time": result.observation["time"],
-            "action": action,
-            "observation": result.observation,
-            "events": [_clean_event(e) for e in result.events],
-            "emotions": result.emotions.to_dict(),
-            "affect": {
-                "arousal": round(result.affect.arousal, 3),
-                "valence": round(result.affect.valence, 3),
-                "salience_tags": result.affect.salience_tags,
-                "attention_focus": result.affect.attention_focus,
-            },
-            "goals": engine.goal_engine.to_prompt_text(engine.emotions),
-            "goals_list": [
-                {
-                    "id": g.id,
-                    "description": g.description,
-                    "category": g.category,
-                    "priority": g.effective_priority(engine.emotions),
-                    "failures": g.failure_count,
-                    "completed": g.completed,
-                    "abandoned": g.abandoned,
-                }
-                for g in engine.goal_engine.goals
-            ],
-            "memories": engine.memory.to_prompt_text(),
-            "new_episode": result.new_episode,
-            "npcs": _npc_details(engine),
-            "agent_prompt": result.agent_prompt,
-        }
+        # Tick the world with the agent's chosen action
+        result = engine.tick(agent_action=decision.action)
+
+        step_data = _build_step_data(engine, result, decision)
         results.append(step_data)
         session["history"].append(step_data)
 
@@ -181,35 +147,14 @@ async def manual_action(req: ActionRequest):
 
     result = engine.tick(agent_action=action)
 
-    step_data = {
-        "cycle": engine.cycle_count,
-        "time": result.observation["time"],
-        "action": action,
-        "observation": result.observation,
-        "events": [_clean_event(e) for e in result.events],
-        "emotions": result.emotions.to_dict(),
-        "affect": {
-            "arousal": round(result.affect.arousal, 3),
-            "valence": round(result.affect.valence, 3),
-            "salience_tags": result.affect.salience_tags,
-        },
-        "goals": engine.goal_engine.to_prompt_text(engine.emotions),
-        "goals_list": [
-            {
-                "id": g.id,
-                "description": g.description,
-                "category": g.category,
-                "priority": g.effective_priority(engine.emotions),
-                "failures": g.failure_count,
-                "completed": g.completed,
-                "abandoned": g.abandoned,
-            }
-            for g in engine.goal_engine.goals
-        ],
-        "memories": engine.memory.to_prompt_text(),
-        "new_episode": result.new_episode,
-        "npcs": _npc_details(engine),
-    }
+    from autobot.llm_agent import AgentDecision
+    decision = AgentDecision(
+        thinking="[Manual action — player override]",
+        action=action,
+        used_llm=False,
+    )
+
+    step_data = _build_step_data(engine, result, decision)
     session["history"].append(step_data)
     return step_data
 
@@ -235,6 +180,42 @@ async def get_session(session_id: str):
 
 # ---- Helpers ----
 
+def _build_step_data(engine, result, decision):
+    return {
+        "cycle": engine.cycle_count,
+        "time": result.observation["time"],
+        "action": decision.action,
+        "thinking": decision.thinking,
+        "used_llm": decision.used_llm,
+        "observation": result.observation,
+        "events": [_clean_event(e) for e in result.events],
+        "emotions": result.emotions.to_dict(),
+        "affect": {
+            "arousal": round(result.affect.arousal, 3),
+            "valence": round(result.affect.valence, 3),
+            "salience_tags": result.affect.salience_tags,
+            "attention_focus": result.affect.attention_focus,
+        },
+        "goals": engine.goal_engine.to_prompt_text(engine.emotions),
+        "goals_list": [
+            {
+                "id": g.id,
+                "description": g.description,
+                "category": g.category,
+                "priority": g.effective_priority(engine.emotions),
+                "failures": g.failure_count,
+                "completed": g.completed,
+                "abandoned": g.abandoned,
+            }
+            for g in engine.goal_engine.goals
+        ],
+        "memories": engine.memory.to_prompt_text(),
+        "new_episode": result.new_episode,
+        "npcs": _npc_details(engine),
+        "agent_prompt": result.agent_prompt,
+    }
+
+
 def _npc_details(engine: WorldEngine) -> list[dict]:
     return [
         {
@@ -248,7 +229,6 @@ def _npc_details(engine: WorldEngine) -> list[dict]:
 
 
 def _clean_event(ev: dict) -> dict:
-    """Remove internal fields from events for the API."""
     cleaned = dict(ev)
     for key in ("world_time", "day", "hour"):
         cleaned.pop(key, None)

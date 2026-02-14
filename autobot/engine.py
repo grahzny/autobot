@@ -42,6 +42,8 @@ class CycleResult:
     memory_text: str
     new_episode: bool
     agent_prompt: str
+    agent_thinking: str = ""       # inner monologue from the LLM
+    used_llm: bool = False         # whether the LLM was the decision-maker
 
 
 @dataclass
