@@ -3,9 +3,13 @@ name = "autobot"
 version = "0.1.0"
 description = "AI World Model — Logic & Language Environment"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+]
 
 [project.optional-dependencies]
+llm = ["anthropic>=0.30.0"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autobot — AI World Model</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Start Screen -->
+    <div id="start-screen" class="screen active">
+      <div class="start-container">
+        <h1 class="logo">AUTOBOT</h1>
+        <p class="subtitle">AI World Model — Logic &amp; Language Environment</p>
+        <div class="scenario-grid">
+          <button class="scenario-card" data-scenario="broken_promise">
+            <span class="scenario-icon">💔</span>
+            <span class="scenario-name">Broken Promise</span>
+            <span class="scenario-desc">Missed deadline triggers trust repair</span>
+          </button>
+          <button class="scenario-card" data-scenario="hidden_betrayal">
+            <span class="scenario-icon">🗡️</span>
+            <span class="scenario-name">Hidden Betrayal</span>
+            <span class="scenario-desc">NPC spreads misinformation secretly</span>
+          </button>
+          <button class="scenario-card" data-scenario="delayed_reward">
+            <span class="scenario-icon">⏳</span>
+            <span class="scenario-name">Delayed Reward</span>
+            <span class="scenario-desc">Short-term gain vs long-term trust</span>
+          </button>
+          <button class="scenario-card" data-scenario="competing_goals">
+            <span class="scenario-icon">⚖️</span>
+            <span class="scenario-name">Competing Goals</span>
+            <span class="scenario-desc">Low energy vs reputation at risk</span>
+          </button>
+          <button class="scenario-card" data-scenario="ambiguous_intent">
+            <span class="scenario-icon">❓</span>
+            <span class="scenario-name">Ambiguous Intent</span>
+            <span class="scenario-desc">Vague NPC statement demands interpretation</span>
+          </button>
+        </div>
+        <div class="start-options">
+          <label class="toggle-label">
+            <input type="checkbox" id="use-llm-toggle">
+            <span>Use Claude LLM (requires ANTHROPIC_API_KEY)</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Simulation Screen -->
+    <div id="sim-screen" class="screen">
+      <header class="sim-header">
+        <div class="header-left">
+          <button id="back-btn" class="btn-icon" title="Back to scenarios">←</button>
+          <h2 id="scenario-title"></h2>
+        </div>
+        <div class="header-center">
+          <span id="time-display" class="time-badge">Day 1, 08:00</span>
+          <span id="cycle-display" class="cycle-badge">Cycle 0</span>
+        </div>
+        <div class="header-right">
+          <button id="step-btn" class="btn primary">Step</button>
+          <button id="run5-btn" class="btn">Run 5</button>
+          <button id="run-btn" class="btn">Auto-Run</button>
+          <button id="stop-btn" class="btn danger hidden">Stop</button>
+        </div>
+      </header>
+
+      <main class="sim-body">
+        <!-- Left Column: Agent State -->
+        <section class="panel agent-panel">
+          <h3>Agent</h3>
+          <div class="stat-group">
+            <div class="stat-row">
+              <span class="stat-label">Energy</span>
+              <div class="bar-container">
+                <div id="energy-bar" class="bar energy-bar" style="width:100%"></div>
+              </div>
+              <span id="energy-val" class="stat-val">1.00</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-label">Reputation</span>
+              <div class="bar-container">
+                <div id="rep-bar" class="bar rep-bar" style="width:50%"></div>
+              </div>
+              <span id="rep-val" class="stat-val">0.50</span>
+            </div>
+          </div>
+
+          <h4>Emotions</h4>
+          <div id="emotions-grid" class="emotions-grid"></div>
+
+          <h4>Fast Affect</h4>
+          <div id="affect-display" class="affect-display">
+            <span class="affect-item">Arousal: <b id="arousal-val">0.00</b></span>
+            <span class="affect-item">Valence: <b id="valence-val">0.00</b></span>
+          </div>
+          <div id="salience-tags" class="tag-list"></div>
+        </section>
+
+        <!-- Center Column: Event Feed -->
+        <section class="panel feed-panel">
+          <h3>Event Feed</h3>
+          <div id="event-feed" class="event-feed"></div>
+        </section>
+
+        <!-- Right Column: World State -->
+        <section class="panel world-panel">
+          <h3>NPCs</h3>
+          <div id="npc-list" class="npc-list"></div>
+
+          <h3>Goals</h3>
+          <div id="goals-list" class="goals-list"></div>
+
+          <h3>Projects</h3>
+          <div id="projects-list" class="projects-list"></div>
+
+          <h3>Commitments</h3>
+          <div id="commitments-list" class="commitments-list"></div>
+
+          <h3>Memory</h3>
+          <div id="memory-list" class="memory-list"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
