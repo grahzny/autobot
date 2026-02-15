@@ -24,45 +24,45 @@ class TestEmotionalInfluence:
             id="r", description="repair trust with someone",
             category="relationship", priority=0.5,
         )
-        calm = EmotionalState(anxiety=0.0, avoidance_bias=0.0)
-        anxious = EmotionalState(anxiety=0.8, avoidance_bias=0.3)
+        calm = EmotionalState(anxiety=0.0, caution=0.0)
+        anxious = EmotionalState(anxiety=0.8, caution=0.3)
 
         p_calm = g_relationship.effective_priority(calm)
         p_anxious = g_relationship.effective_priority(anxious)
         assert p_anxious > p_calm
 
-    def test_avoidance_bias_reduces_exploration_priority(self):
+    def test_caution_reduces_exploration_priority(self):
         g = Goal(
             id="e", description="explore topic",
             category="exploration", priority=0.5,
         )
-        low_avoidance = EmotionalState(avoidance_bias=0.0)
-        high_avoidance = EmotionalState(avoidance_bias=0.8)
-        assert g.effective_priority(low_avoidance) > g.effective_priority(high_avoidance)
+        low_caution = EmotionalState(caution=0.0)
+        high_caution = EmotionalState(caution=0.8)
+        assert g.effective_priority(low_caution) > g.effective_priority(high_caution)
 
-    def test_amygdala_fires_on_trust_drop(self):
+    def test_amygdala_fires_on_trade_loss(self):
         cs = ChatState()
-        events = [{"type": "trust_change", "person": "Alice", "delta": -0.2}]
+        events = [{"type": "trade_loss", "ticker": "BHP.AX", "pnl": -30.0}]
         affect = evaluate_amygdala(events, cs)
         assert affect.arousal > 0.3
         assert affect.valence < 0
-        assert "trust_drop" in affect.salience_tags
+        assert "loss" in affect.salience_tags
 
-    def test_amygdala_fires_on_boundary_crossed(self):
+    def test_amygdala_fires_on_starvation(self):
         cs = ChatState()
-        events = [{"type": "boundary_crossed", "person": "Bob"}]
+        events = [{"type": "starvation_warning"}]
         affect = evaluate_amygdala(events, cs)
         assert affect.arousal > 0.0
         assert affect.valence < 0
 
-    def test_social_warmth_boosts_connection_goals(self):
+    def test_conviction_boosts_connection_goals(self):
         g = Goal(
             id="c", description="connect with someone",
             category="connection", priority=0.5,
         )
-        cold = EmotionalState(social_warmth=0.0)
-        warm = EmotionalState(social_warmth=0.8)
-        assert g.effective_priority(warm) > g.effective_priority(cold)
+        low = EmotionalState(conviction=0.0)
+        high = EmotionalState(conviction=0.8)
+        assert g.effective_priority(high) > g.effective_priority(low)
 
 
 # ======================================================================

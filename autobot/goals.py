@@ -218,6 +218,11 @@ class GoalEngine:
                     "belonging": ("Have a genuine exchange with someone", "connection"),
                     "competence": ("Resolve something I'm stuck on", "understanding"),
                     "autonomy": ("Do something self-directed", "self"),
+                    # EconomicState field names (Phase 1 compat)
+                    "alpha": ("Find something new and interesting", "exploration"),
+                    "roi": ("Have a genuine exchange with someone", "connection"),
+                    "volatility": ("Attend to risk management", "self"),
+                    "cost_pressure": ("Do something self-directed", "self"),
                 }
                 desc, cat = need_goals.get(lowest_name, ("Attend to myself", "self"))
                 if desc not in existing:

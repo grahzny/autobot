@@ -249,3 +249,147 @@ class ChatState:
             "or fact."
         )
         return "\n".join(lines)
+
+
+# ======================================================================
+# MarketState -- market entity's view of the world
+# ======================================================================
+
+
+@dataclass
+class MarketState:
+    """The market entity's view of its world.
+
+    Replaces ChatState for the market entity. Chris is the only
+    human the entity talks to.
+    """
+
+    # Time
+    tick_count: int = 0
+    start_time: float = field(default_factory=time.time)
+    timezone: str = "Australia/Melbourne"
+
+    # The entity itself
+    name: str = "Ryn"
+    energy: float = 1.0
+
+    # Chris (the only human)
+    chris: PersonProfile | None = None
+    pending_messages: list[PendingMessage] = field(default_factory=list)
+    conversations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    # Market tracking
+    last_prices: dict[str, float] = field(default_factory=dict)
+    last_session: str = ""           # track market session transitions
+    last_price_fetch_tick: int = 0
+
+    # History and mood
+    history: list[dict[str, Any]] = field(default_factory=list)
+    mood_history: list[dict[str, Any]] = field(default_factory=list)
+
+    # Thinking log (for UI display)
+    thinking_log: list[dict[str, Any]] = field(default_factory=list)
+
+    # --- People compatibility (for code that uses self.state.people) ---
+    @property
+    def people(self) -> dict[str, PersonProfile]:
+        if self.chris:
+            return {"chris": self.chris}
+        return {}
+
+    def get_person(self, person_id: str) -> PersonProfile | None:
+        if person_id == "chris" and self.chris:
+            return self.chris
+        return None
+
+    def get_or_create_person(self, person_id: str, name: str) -> PersonProfile:
+        if self.chris is None:
+            self.chris = PersonProfile(id="chris", name=name)
+        return self.chris
+
+    def add_message(self, person_id: str, text: str) -> PendingMessage:
+        msg = PendingMessage(
+            id=str(uuid4())[:8],
+            person_id="chris",
+            text=text,
+            received_at=time.time(),
+        )
+        self.pending_messages.append(msg)
+        self.conversations.setdefault("chris", []).append({
+            "role": "human", "text": text, "time": time.time(),
+        })
+        if self.chris:
+            self.chris.last_message_time = time.time()
+        return msg
+
+    def add_entity_message(self, person_id: str, text: str) -> None:
+        self.conversations.setdefault("chris", []).append({
+            "role": "entity", "text": text, "time": time.time(),
+        })
+        if self.chris:
+            self.chris.last_interaction_time = time.time()
+            self.chris.conversation_count += 1
+
+    def unprocessed_messages(self) -> list[PendingMessage]:
+        return [m for m in self.pending_messages if not m.processed]
+
+    def recent_conversation(self, person_id: str, limit: int = 10) -> list[dict]:
+        return self.conversations.get("chris", [])[-limit:]
+
+    def record(self, event: dict[str, Any]) -> None:
+        event.setdefault("time", time.time())
+        event.setdefault("tick", self.tick_count)
+        self.history.append(event)
+
+    def record_thinking(self, thought: str, category: str = "general") -> None:
+        """Log an internal thought for UI display."""
+        self.thinking_log.append({
+            "thought": thought,
+            "category": category,
+            "time": time.time(),
+            "tick": self.tick_count,
+        })
+        if len(self.thinking_log) > 200:
+            self.thinking_log = self.thinking_log[-200:]
+
+    def seconds_since_any_interaction(self) -> float:
+        if self.chris and self.chris.last_interaction_time:
+            return time.time() - self.chris.last_interaction_time
+        return float("inf")
+
+    def ground_truth_text(
+        self,
+        market_text: str = "",
+        portfolio_text: str = "",
+        capital_text: str = "",
+    ) -> str:
+        """Render ground truth including market status."""
+        now = time.time()
+        uptime = now - self.start_time
+        lines = ["=== GROUND TRUTH (only these facts are established) ==="]
+        lines.append(f"Tick count: {self.tick_count}")
+        lines.append(f"Uptime: {int(uptime / 60)} minutes")
+
+        if market_text:
+            lines.append("")
+            lines.append(market_text)
+
+        if portfolio_text:
+            lines.append("")
+            lines.append(portfolio_text)
+
+        if capital_text:
+            lines.append("")
+            lines.append(capital_text)
+
+        # Chris contact info
+        if self.chris:
+            if self.chris.last_message_time:
+                mins = int((now - self.chris.last_message_time) / 60)
+                lines.append(f"\nChris: last message {mins} min ago")
+            else:
+                lines.append("\nChris: no messages yet")
+
+        lines.append("")
+        lines.append("Anything not listed above is NOT established fact.")
+        return "\n".join(lines)

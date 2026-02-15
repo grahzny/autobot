@@ -38,6 +38,16 @@ _FACT_CLAIM_PATTERNS = [
     re.compile(r"(?i)\bthe (?:fact|truth) is\b.{5,}"),
 ]
 
+# Patterns suggesting ungrounded market predictions
+_MARKET_CLAIM_PATTERNS = [
+    re.compile(r"(?i)\b(?:the stock|it|the price) will\b.{5,}"),
+    re.compile(r"(?i)\b(?:it's|it is) going to (?:rally|crash|drop|surge|moon)\b"),
+    re.compile(r"(?i)\bearnings will (?:beat|miss|exceed)\b"),
+    re.compile(r"(?i)\bguaranteed (?:return|profit|gain)\b"),
+    re.compile(r"(?i)\bcan't (?:lose|go down|fail)\b"),
+    re.compile(r"(?i)\b(?:definitely|certainly|absolutely) (?:buy|sell|going)\b"),
+]
+
 
 def check_grounding(
     text: str,
@@ -131,3 +141,43 @@ def ground_notes(
             grounded.append(f"[unverified] {note}")
 
     return grounded
+
+
+def check_market_grounding(
+    text: str,
+    known_prices: dict[str, float] | None = None,
+    known_fundamentals: dict[str, dict] | None = None,
+) -> GroundingResult:
+    """Check text for ungrounded market assertions.
+
+    Flags speculative predictions that claim certainty, and price claims
+    that don't match known data.
+    """
+    flags: list[str] = []
+
+    for pattern in _MARKET_CLAIM_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            flags.append(f"market_prediction: {match.group(0)[:80]}")
+
+    # Check price claims against known data
+    if known_prices:
+        price_pattern = re.compile(
+            r"(?i)(?:trading at|priced at|currently at|worth)\s*\$?([\d,]+(?:\.\d+)?)"
+        )
+        for match in price_pattern.finditer(text):
+            claimed_price = float(match.group(1).replace(",", ""))
+            # Check if any known price is close
+            near_known = any(
+                abs(claimed_price - p) / p < 0.05  # within 5%
+                for p in known_prices.values()
+                if p > 0
+            )
+            if not near_known and claimed_price > 0:
+                flags.append(f"price_claim: ${claimed_price:.2f} (not near any known price)")
+
+    return GroundingResult(
+        original=text,
+        flags=flags,
+        ungrounded_count=len(flags),
+    )

@@ -1,144 +1,231 @@
-"""Needs/Drives system -- 5 fundamental drives that decay and must be satisfied.
+"""EconomicState -- Market-driven needs that replace conversational drives.
 
-Each need is a 0-1 value (1 = fully satisfied). Needs decay passively every
-tick and are restored only by specific events/actions. When needs are low,
-they override emotional baselines (breaking the "golden retriever lock") and
-drive goal generation.
+Four economic indicators (0-1 each) that decay passively and are restored
+by market events. These map onto the original need categories:
+
+- alpha (Meaning): restored by profitable trades + high-conviction research
+- roi (Competence): tied to Sharpe ratio + prediction accuracy
+- volatility (Anxiety): rises with market uncertainty + drawdown
+- cost_pressure (Irritability): rises when token spend exceeds budget
+
+When economic state is poor, the entity becomes more cautious and
+cost-conscious in its decision-making.
 """
 
 from __future__ import annotations
 
-import time as _time
 from dataclasses import dataclass
 from typing import Any
 
 
 @dataclass
-class NeedsState:
-    """Five fundamental needs, each 0-1 (1 = fully satisfied)."""
+class EconomicState:
+    """Four economic indicators, each 0-1."""
 
-    stimulation: float = 0.7       # drops without novelty
-    meaning: float = 0.6           # drops when goals stall
-    belonging: float = 0.7         # drops with unreciprocated outreach / silence
-    competence: float = 0.7        # drops after failure/confusion
-    autonomy: float = 0.8          # drops when constantly responding/performing
+    alpha: float = 0.5           # meaning -- restored by profits + conviction
+    roi: float = 0.5             # competence -- tied to Sharpe + accuracy
+    volatility: float = 0.3      # anxiety -- rises with uncertainty + drawdown
+    cost_pressure: float = 0.3   # irritability -- rises with high token spend
+
+    # Backward-compat properties mapping old NeedsState names -> economic fields.
+    # Removed in Phase 3 when all consumers are rewritten.
+    @property
+    def stimulation(self) -> float:
+        return self.alpha
+    @stimulation.setter
+    def stimulation(self, v: float) -> None:
+        self.alpha = v
+    @property
+    def meaning(self) -> float:
+        return self.alpha
+    @meaning.setter
+    def meaning(self, v: float) -> None:
+        self.alpha = v
+    @property
+    def belonging(self) -> float:
+        return self.roi
+    @belonging.setter
+    def belonging(self, v: float) -> None:
+        self.roi = v
+    @property
+    def competence(self) -> float:
+        return self.roi
+    @competence.setter
+    def competence(self, v: float) -> None:
+        self.roi = v
+    @property
+    def autonomy(self) -> float:
+        return 1.0 - self.cost_pressure
+    @autonomy.setter
+    def autonomy(self, v: float) -> None:
+        self.cost_pressure = 1.0 - v
 
     def clamp(self) -> None:
-        for attr in ("stimulation", "meaning", "belonging", "competence", "autonomy"):
+        for attr in ("alpha", "roi", "volatility", "cost_pressure"):
             val = max(0.0, min(1.0, getattr(self, attr)))
             setattr(self, attr, round(val, 3))
 
     def to_dict(self) -> dict[str, float]:
         return {
-            "stimulation": self.stimulation,
-            "meaning": self.meaning,
-            "belonging": self.belonging,
-            "competence": self.competence,
-            "autonomy": self.autonomy,
+            "alpha": self.alpha,
+            "roi": self.roi,
+            "volatility": self.volatility,
+            "cost_pressure": self.cost_pressure,
         }
 
     def lowest_need(self) -> tuple[str, float]:
-        """Return (name, value) of the most deprived need."""
-        items = self.to_dict()
-        name = min(items, key=items.get)  # type: ignore[arg-type]
-        return name, items[name]
+        """Return (name, value) of the most critical economic indicator.
+
+        For alpha/roi: low is bad. For volatility/cost_pressure: high is bad.
+        We normalize: for vol/cost, we invert (1-x) so low = critical.
+        """
+        normalized = {
+            "alpha": self.alpha,
+            "roi": self.roi,
+            "volatility": 1.0 - self.volatility,       # high vol = bad
+            "cost_pressure": 1.0 - self.cost_pressure,  # high cost = bad
+        }
+        name = min(normalized, key=normalized.get)  # type: ignore[arg-type]
+        return name, normalized[name]
 
     def deficit_summary(self) -> str:
-        """Human-readable summary of needs below 0.4."""
+        """Human-readable summary of critical economic indicators."""
         deficits = []
-        for name, val in self.to_dict().items():
-            if val < 0.4:
-                deficits.append(f"{name}={val:.2f}")
+        if self.alpha < 0.3:
+            deficits.append(f"alpha={self.alpha:.2f}")
+        if self.roi < 0.3:
+            deficits.append(f"roi={self.roi:.2f}")
+        if self.volatility > 0.7:
+            deficits.append(f"volatility={self.volatility:.2f}")
+        if self.cost_pressure > 0.7:
+            deficits.append(f"cost_pressure={self.cost_pressure:.2f}")
         return ", ".join(deficits) if deficits else "no critical deficits"
 
 
-# Passive decay rates per tick (15 seconds)
+# Passive decay/settle rates per tick (~15 seconds)
 _DECAY_RATES = {
-    "stimulation": 0.008,   # ~5 min to drop from 0.7 to 0.4 with no novelty
-    "meaning": 0.004,       # slower -- stalls take a while to feel
-    "belonging": 0.006,     # moderate -- silence hurts but not instantly
-    "competence": 0.003,    # slowest passive decay
-    "autonomy": 0.002,      # very slow passive decay, mainly event-driven
+    "alpha": 0.003,          # meaning decays without profitable activity
+    "roi": 0.002,            # competence decays slowly
+    "volatility": 0.005,     # settles down (anxiety decreases)
+    "cost_pressure": 0.003,  # settles down (irritability decreases)
 }
 
 
-def decay_needs(needs: NeedsState) -> None:
-    """Apply passive per-tick decay to all needs."""
+def decay_economic_state(state: EconomicState) -> None:
+    """Apply passive per-tick decay/settling to all indicators."""
     for attr, rate in _DECAY_RATES.items():
-        current = getattr(needs, attr)
-        setattr(needs, attr, current - rate)
-    needs.clamp()
+        current = getattr(state, attr)
+        setattr(state, attr, current - rate)
+    state.clamp()
 
 
-def update_needs_from_events(
-    needs: NeedsState,
+def update_economic_state(
+    state: EconomicState,
     events: list[dict[str, Any]],
-    goal_stall_count: int,
-    unanswered_proactive: int,
-    seconds_since_interaction: float,
+    token_cost: float = 0.0,
+    daily_budget_pct: float = 0.0,   # fraction of daily budget spent (0-1)
+    drawdown_pct: float = 0.0,       # current drawdown from peak (0-1)
+    sharpe: float | None = None,
+    trade_pnl: float | None = None,
 ) -> None:
-    """
-    Update needs based on what happened this tick.
+    """Update economic state based on events and market metrics.
 
-    Restorers:
-    - stimulation: new topics, new encounters, varied themes
-    - meaning: goal progress events, problem resolution
-    - belonging: reciprocal warm exchanges, responses to outreach
-    - competence: successful resolution, insight gained
-    - autonomy: self-directed reflection, idle thought, choosing silence
-
-    Extra drains:
-    - meaning: goal_stall_count > 3 -> extra drain
-    - belonging: unanswered_proactive > 0 -> extra drain
-    - stimulation: long silence -> extra drain
+    Args:
+        state: The economic state to update.
+        events: List of market events from this tick.
+        token_cost: Cost of LLM calls this tick.
+        daily_budget_pct: Fraction of daily budget spent so far (0-1).
+        drawdown_pct: Current portfolio drawdown from peak (0-1).
+        sharpe: Current Sharpe ratio (None if insufficient data).
+        trade_pnl: P&L from any trade closed this tick.
     """
     for ev in events:
         etype = ev.get("type", "")
 
-        # Stimulation restorers
-        if etype in ("new_encounter", "new_topic"):
-            needs.stimulation += 0.15
-        if etype in ("humor", "enthusiasm_shared"):
-            needs.stimulation += 0.08
-        if etype in ("meaningful_exchange",):
-            needs.stimulation += 0.05
+        # Alpha (meaning) restorers
+        if etype == "trade_profit":
+            state.alpha += 0.15
+        if etype == "thesis_confirmed":
+            state.alpha += 0.10
+        if etype == "high_conviction_research":
+            state.alpha += 0.05
 
-        # Meaning restorers
-        if etype == "goal_progress":
-            needs.meaning += 0.15
-        if etype == "insight_gained":
-            needs.meaning += 0.10
+        # Alpha drains
+        if etype == "trade_loss":
+            state.alpha -= 0.10
+        if etype == "thesis_invalidated":
+            state.alpha -= 0.08
 
-        # Belonging restorers
-        if etype in ("meaningful_exchange", "vulnerability_shared", "reconnection"):
-            needs.belonging += 0.12
-        if etype in ("greeting", "agreement", "compliment_received"):
-            needs.belonging += 0.06
+        # ROI (competence) restorers
+        if etype == "prediction_accurate":
+            state.roi += 0.08
+        if etype == "trade_profit":
+            state.roi += 0.06
 
-        # Belonging drains
-        if etype in ("being_ignored", "dismissive_tone"):
-            needs.belonging -= 0.08
+        # ROI drains
+        if etype == "prediction_wrong":
+            state.roi -= 0.06
+        if etype == "trade_loss":
+            state.roi -= 0.08
 
-        # Competence restorers
-        if etype == "insight_gained":
-            needs.competence += 0.10
-        # Competence drains
-        if etype in ("criticism_received", "disagreement"):
-            needs.competence -= 0.06
+        # Volatility (anxiety) drivers
+        if etype in ("price_alert", "news_negative"):
+            state.volatility += 0.06
+        if etype == "drawdown":
+            state.volatility += 0.10
+        if etype == "starvation_warning":
+            state.volatility += 0.15
 
-        # Autonomy restorers
-        if etype in ("self_reflection", "idle_thought"):
-            needs.autonomy += 0.04
-        # Autonomy drain from constant performing
-        if etype == "entity_spoke":
-            needs.autonomy -= 0.02
+        # Volatility reducers
+        if etype in ("recovery", "news_positive"):
+            state.volatility -= 0.04
+        if etype == "trade_profit":
+            state.volatility -= 0.06
 
-    # Extra drains from state
-    if goal_stall_count > 3:
-        needs.meaning -= 0.02 * min(goal_stall_count, 8)
-    if unanswered_proactive > 0:
-        needs.belonging -= 0.04 * min(unanswered_proactive, 3)
-    if seconds_since_interaction != float("inf") and seconds_since_interaction > 300:
-        needs.stimulation -= 0.01  # extra on top of passive decay
+        # Cost pressure drivers
+        if etype == "starvation_warning":
+            state.cost_pressure += 0.12
 
-    needs.clamp()
+    # Direct metric effects
+    if trade_pnl is not None:
+        if trade_pnl > 0:
+            state.alpha += min(0.10, trade_pnl / 50.0)  # scale with P&L
+        else:
+            state.alpha -= min(0.10, abs(trade_pnl) / 50.0)
+
+    if sharpe is not None:
+        # Sharpe > 1 is good, < 0 is bad
+        if sharpe > 1.0:
+            state.roi += 0.05
+        elif sharpe < 0:
+            state.roi -= 0.05
+
+    # Cost pressure from token spending
+    if daily_budget_pct > 0.8:
+        state.cost_pressure += 0.08
+    elif daily_budget_pct > 0.5:
+        state.cost_pressure += 0.03
+
+    # Drawdown raises volatility
+    if drawdown_pct > 0.1:
+        state.volatility += min(0.15, drawdown_pct * 0.5)
+
+    state.clamp()
+
+
+# --- Backward compatibility aliases ---
+# Other modules (emotions, living_engine) still import these during Phase 1.
+# These aliases will be removed in Phase 3 when all consumers are rewritten.
+NeedsState = EconomicState
+decay_needs = decay_economic_state
+
+
+def update_needs_from_events(
+    needs: EconomicState,
+    events: list[dict[str, Any]],
+    goal_stall_count: int = 0,
+    unanswered_proactive: int = 0,
+    seconds_since_interaction: float = 0.0,
+) -> None:
+    """Backward-compatible shim mapping old needs events to economic state updates."""
+    update_economic_state(needs, events)

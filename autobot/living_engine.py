@@ -1,7 +1,11 @@
 """Living Engine -- the entity's core loop.
 
-Replaces the simulation-oriented WorldEngine with a chat-aware tick cycle.
-Each tick: time effects -> analyze messages -> emotions -> memory -> goals -> decide -> act
+Contains two engines:
+  - LivingEngine: Original chat-oriented tick cycle (backward compat)
+  - MarketEngine: Market-trading tick cycle (15-step Perceive/Appraise/Strategize/Execute)
+
+MarketEngine is the primary engine for the market entity. LivingEngine is retained
+for backward compatibility with existing tests.
 """
 
 from __future__ import annotations
@@ -1850,3 +1854,1292 @@ def _try_extract_target(raw: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+# ======================================================================
+# MarketEngine -- 15-step market tick cycle
+# ======================================================================
+
+from autobot.accountant import Accountant
+from autobot.brain import (
+    analyze_market_data,
+    reason_trade,
+    strategic_synthesis,
+    respond_to_chris,
+)
+from autobot.chat_state import MarketState
+from autobot.market import MarketMonitor
+from autobot.needs import EconomicState, decay_economic_state, update_economic_state
+from autobot.news import NewsHarvester
+from autobot.portfolio import Portfolio
+from autobot.prediction import TradePredictionTracker
+from autobot.research import ResearchLedger, ResearchNote, TradeRationale, PostMortem
+from autobot.strategy import StrategyEngine, TradingObjective
+
+
+@dataclass
+class MarketTickResult:
+    """What happened during one market engine tick."""
+
+    tick: int
+    decision: str  # respond_chris, analyze, trade, monitor, synthesize, idle
+    target_person_id: str | None = None
+    outgoing_message: str | None = None
+    thinking: str = ""
+    affect: AffectState = field(default_factory=AffectState)
+    emotions: EmotionalState = field(default_factory=EmotionalState)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    economic_state: dict[str, float] = field(default_factory=dict)
+
+    # Trade action details
+    trade_action: str | None = None  # buy, sell, hold, wait
+    trade_ticker: str | None = None
+    trade_pnl: float | None = None
+
+    # Starvation
+    is_dead: bool = False
+    starvation_level: str | None = None
+
+
+@dataclass
+class MarketEngine:
+    """The market entity's autonomous core -- 15-step tick cycle."""
+
+    # Core state
+    state: MarketState = field(default_factory=MarketState)
+    emotions: EmotionalState = field(default_factory=EmotionalState)
+    economic: EconomicState = field(default_factory=EconomicState)
+
+    # Market subsystems
+    accountant: Accountant = field(default_factory=Accountant)
+    monitor: MarketMonitor = field(default_factory=MarketMonitor)
+    portfolio: Portfolio = field(default_factory=Portfolio)
+    strategy: StrategyEngine = field(default_factory=StrategyEngine)
+    research: ResearchLedger = field(default_factory=ResearchLedger)
+    news: NewsHarvester = field(default_factory=NewsHarvester)
+    trade_predictions: TradePredictionTracker = field(
+        default_factory=TradePredictionTracker
+    )
+
+    # Shared subsystems (retained from LivingEngine)
+    memory: EpisodicMemory = field(default_factory=EpisodicMemory)
+    prediction_engine: PredictionEngine = field(default_factory=PredictionEngine)
+    repetition_tracker: RepetitionTracker = field(default_factory=RepetitionTracker)
+
+    # Legacy compat (some tests still reference these)
+    goal_engine: GoalEngine = field(default_factory=GoalEngine)
+
+    # Identity
+    identity: Identity = field(default_factory=Identity.default)
+
+    # Internal state
+    _born: bool = False
+    _last_affect: AffectState = field(default_factory=AffectState)
+    _last_user_context: dict[str, Any] | None = None
+    last_thinking: str = ""
+    last_decision: str = "idle"
+    thinking_history: list[dict[str, Any]] = field(default_factory=list)
+
+    # Backward compat alias
+    @property
+    def needs(self) -> EconomicState:
+        return self.economic
+
+    @needs.setter
+    def needs(self, v: EconomicState) -> None:
+        self.economic = v
+
+    # ------------------------------------------------------------------
+    # Initialization from Identity
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_identity(cls, identity: Identity | None = None) -> MarketEngine:
+        """Create a MarketEngine from an Identity config."""
+        identity = identity or Identity.default()
+        engine = cls(identity=identity)
+
+        # Configure accountant from identity
+        engine.accountant.operating_capital = identity.starting_capital
+        engine.accountant.token_cost_input = identity.token_cost_input
+        engine.accountant.token_cost_output = identity.token_cost_output
+
+        # Configure portfolio from identity
+        engine.portfolio.brokerage_fee = identity.brokerage_fee
+        engine.portfolio.slippage_pct = identity.slippage_pct
+        engine.portfolio.max_position_pct = identity.max_position_pct
+        engine.portfolio.cash = identity.starting_capital
+
+        # Configure market monitor
+        engine.monitor.timezone = identity.timezone
+        engine.state.timezone = identity.timezone
+        engine.state.name = identity.name
+
+        # Seed watchlist
+        for ticker in identity.seed_watchlist:
+            engine.monitor.add_ticker(ticker)
+
+        return engine
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def receive_message(self, person_id: str, person_name: str, text: str) -> None:
+        """Chris sent a message. Queue it for processing."""
+        self.state.get_or_create_person(person_id, person_name)
+        self.state.add_message(person_id, text)
+
+    def calculate_tick_interval(self) -> float:
+        """Calculate adaptive tick interval in seconds.
+
+        - Market open + positions: 30s
+        - Market open + no positions: 60s
+        - Market closed (weekday): 300s
+        - Weekend (Saturday): 600s
+        - Sunday: 300s (synthesis day)
+        - Capital < $10: 600s
+        - Capital < $5: 900s
+        - Chris message pending: override to 30s
+        """
+        # Chris message -> fast response
+        if self.state.unprocessed_messages():
+            return 30.0
+
+        # Starvation slows everything
+        if self.accountant.operating_capital < 5:
+            return 900.0
+        if self.accountant.operating_capital < 10:
+            return 600.0
+
+        # Sunday synthesis
+        if self.monitor.is_sunday():
+            return 300.0
+
+        # Market hours
+        if self.monitor.is_market_open():
+            if self.portfolio.open_positions():
+                return 30.0  # active positions need monitoring
+            return 60.0
+
+        # Weekend
+        now = self.monitor._now_local()
+        if now.weekday() == 5:  # Saturday
+            return 600.0
+
+        # Weekday, market closed
+        return 300.0
+
+    # ------------------------------------------------------------------
+    # Birth routine
+    # ------------------------------------------------------------------
+
+    def _birth(self) -> None:
+        """First-tick initialization. Seeds identity, interests, birth memory."""
+        if self._born:
+            return
+        self._born = True
+
+        from autobot.memory import Episode
+
+        now = time.time()
+        self.state.name = self.identity.name
+
+        # Refresh daily budget
+        self.accountant.refresh_daily_budget()
+
+        # Birth memory
+        watchlist_str = ", ".join(self.identity.seed_watchlist[:5])
+        birth_summary = (
+            f"I came into existence. My name is {self.identity.name}. "
+            f"Starting capital: ${self.accountant.operating_capital:.2f}. "
+            f"Watchlist: {watchlist_str}."
+        )
+        birth_episode = Episode(
+            id=self.memory._next_id(),
+            time=now,
+            summary=birth_summary,
+            involved_entities=[],
+            emotion_arousal=0.5,
+            emotion_valence=0.3,
+            salience_tags=["birth", "novelty"],
+            state_snapshot={"capital": self.accountant.operating_capital},
+            unresolved=False,
+            theme_tag="birth",
+        )
+        self.memory.episodes.append(birth_episode)
+
+        birth_thought = (
+            f"I exist. I'm {self.identity.name}. "
+            f"Capital: ${self.accountant.operating_capital:.2f}. "
+            f"Watching: {watchlist_str}. Let's analyze."
+        )
+        self.thinking_history.append({
+            "tick": 0, "time": now,
+            "decision": "birth", "thinking": birth_thought,
+        })
+        self.last_thinking = birth_thought
+        self.state.record_thinking(birth_thought, "birth")
+
+    # ------------------------------------------------------------------
+    # Main tick cycle (15 steps)
+    # ------------------------------------------------------------------
+
+    def tick(self) -> MarketTickResult:
+        """
+        One market heartbeat cycle.
+
+         0. Birth routine (first tick only)
+         1. Starvation check
+         2. Refresh daily budget
+         3. Perceive (prices, alerts, news, Chris messages, session transitions)
+         4. Decay economic state
+         5. Generate market events from perception
+         6. Amygdala (fast affect)
+         7. Reflective emotions
+         8. Appraise (mark-to-market, predictions, economic update)
+         9. Strategize (auto-generate + prioritize)
+        10. Decide
+        11. Execute (LLM or heuristic)
+        12. Record themes
+        13. Post-mortem (if trade closed)
+        14. Action feedback
+        """
+        # 0. Birth
+        if not self._born:
+            self._birth()
+
+        self.state.tick_count += 1
+        all_events: list[dict[str, Any]] = []
+
+        # 1. Starvation check
+        if not self.accountant.is_alive():
+            return self._death_result()
+
+        # 2. Refresh daily budget
+        self.accountant.refresh_daily_budget()
+
+        # 3. Perceive
+        perception_events = self._perceive()
+        all_events.extend(perception_events)
+
+        # 4. Decay economic state
+        decay_economic_state(self.economic)
+
+        # 5. Market events already generated in _perceive
+
+        # 6. Amygdala
+        affect = evaluate_amygdala(all_events, self.state)
+        self._last_affect = affect
+
+        # 7. Reflective emotions
+        self.emotions = update_reflective_emotions(
+            self.emotions, affect, self.state,
+            needs=self.economic,
+            prediction_error=None,
+            user_context=self._last_user_context,
+        )
+        self._last_user_context = None
+        apply_emotional_weather(self.emotions, self.state.tick_count)
+
+        # Energy drain
+        drain = emotional_energy_drain(affect)
+        if drain > 0:
+            self.state.energy = max(0.0, self.state.energy - drain)
+
+        # 8. Appraise
+        appraisal_events = self._appraise()
+        all_events.extend(appraisal_events)
+
+        # 9. Strategize
+        self._strategize()
+
+        # 10. Decide
+        decision = self._decide_market(all_events)
+
+        # 11. Execute
+        result = self._execute_market(decision, affect, all_events)
+        result.affect = affect
+        result.emotions = EmotionalState(**self.emotions.to_dict())
+        result.events = all_events
+        result.economic_state = self.economic.to_dict()
+        result.starvation_level = self.accountant.starvation_warning()
+
+        # 12. Record themes
+        if result.thinking or result.outgoing_message:
+            themes = self._extract_market_themes(result)
+            if themes:
+                self.repetition_tracker.record_themes(
+                    themes, self.state.tick_count, decision,
+                )
+
+        # 13. Post-mortem (handled during trade execution)
+
+        # 14. Action feedback
+        action_events = self._create_market_action_events(result)
+        if action_events:
+            action_affect = evaluate_amygdala(action_events, self.state)
+            affect.arousal = min(1.0, affect.arousal + action_affect.arousal)
+            affect.valence = max(
+                -1.0, min(1.0, affect.valence + action_affect.valence)
+            )
+            affect.salience_tags.extend(action_affect.salience_tags)
+            self.emotions = update_reflective_emotions(
+                self.emotions, action_affect, self.state,
+                needs=self.economic,
+            )
+            all_events.extend(action_events)
+
+        # Record mood
+        self.state.mood_history.append({
+            "tick": self.state.tick_count,
+            "time": time.time(),
+            "emotions": self.emotions.to_dict(),
+            "arousal": affect.arousal,
+            "valence": affect.valence,
+            "decision": decision,
+        })
+
+        # Record events
+        for ev in all_events:
+            self.state.record(ev)
+
+        self.last_thinking = result.thinking
+        self.last_decision = decision
+
+        # Accumulate thinking
+        if result.thinking:
+            self.thinking_history.append({
+                "tick": self.state.tick_count,
+                "time": time.time(),
+                "decision": decision,
+                "thinking": result.thinking,
+            })
+            if len(self.thinking_history) > 50:
+                self.thinking_history = self.thinking_history[-50:]
+            self.state.record_thinking(result.thinking, decision)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Step 1: Death
+    # ------------------------------------------------------------------
+
+    def _death_result(self) -> MarketTickResult:
+        """Generate a death result when capital is exhausted."""
+        result = MarketTickResult(
+            tick=self.state.tick_count,
+            decision="dead",
+            is_dead=True,
+            starvation_level="FATAL",
+            thinking=(
+                f"Capital exhausted. ${self.accountant.operating_capital:.2f} remaining. "
+                f"Total spent: ${self.accountant.total_spent:.4f}. "
+                f"I am shutting down."
+            ),
+        )
+        self.state.record({"type": "death", "cause": "starvation"})
+        return result
+
+    # ------------------------------------------------------------------
+    # Step 3: Perceive
+    # ------------------------------------------------------------------
+
+    def _perceive(self) -> list[dict[str, Any]]:
+        """Gather market data, news, Chris messages, session transitions."""
+        events: list[dict[str, Any]] = []
+
+        # 3a. Fetch prices (rate-limited)
+        if self.monitor.should_fetch_prices() and self.monitor.is_market_open():
+            try:
+                prices = self.monitor.fetch_prices()
+                for ticker, snap in prices.items():
+                    self.state.last_prices[ticker] = snap.price
+            except Exception:
+                pass  # yfinance errors are non-fatal
+
+        # 3b. Check price alerts
+        alerts = self.monitor.check_alerts()
+        events.extend(alerts)
+
+        # 3c. Fetch news (rate-limited, only if budget allows)
+        now = time.time()
+        if (now - self.monitor.last_news_fetch >= self.monitor.news_fetch_interval
+                and self.accountant.operating_capital > 20):
+            try:
+                tickers = list(self.monitor.watchlist.keys())
+                new_news = self.news.fetch_yfinance_news(tickers)
+                for item in new_news:
+                    events.append({
+                        "type": "news_positive" if "surge" in item.title.lower()
+                              or "beat" in item.title.lower()
+                              or "rise" in item.title.lower()
+                              else "news_negative" if "crash" in item.title.lower()
+                              or "miss" in item.title.lower()
+                              or "drop" in item.title.lower()
+                              else "chris_message",  # neutral news -> minimal event
+                        "ticker": item.ticker,
+                        "title": item.title,
+                        "intensity": 0.3,
+                    })
+                self.monitor.last_news_fetch = now
+            except Exception:
+                pass
+
+        # 3d. Process Chris messages
+        for msg in self.state.unprocessed_messages():
+            msg_events = self._analyze_chris_message(msg)
+            events.extend(msg_events)
+            msg.processed = True
+
+        # 3e. Detect market session transitions
+        current_session = self.monitor.market_session_label()
+        if self.state.last_session and current_session != self.state.last_session:
+            events.append({
+                "type": "session_transition",
+                "from": self.state.last_session,
+                "to": current_session,
+                "intensity": 0.3,
+            })
+        self.state.last_session = current_session
+
+        # Energy regen
+        self.state.energy = min(1.0, self.state.energy + 0.005)
+
+        return events
+
+    def _analyze_chris_message(self, msg) -> list[dict[str, Any]]:
+        """Analyze a message from Chris using heuristics."""
+        person = self.state.chris
+        if not person:
+            self.state.get_or_create_person("chris", "Chris")
+            person = self.state.chris
+
+        analysis = analyze_message(
+            text=msg.text,
+            person_name=person.name,
+            relationship_hint=person.disposition_hint(),
+            mood=self.emotions.dominant_mood(),
+            recent_messages=self.state.recent_conversation("chris", limit=5),
+        )
+
+        events: list[dict[str, Any]] = []
+        for trigger in analysis.triggers:
+            events.append({
+                "type": trigger.get("type", ""),
+                "person": person.name,
+                "intensity": trigger.get("intensity", 0.5),
+                "text": msg.text[:100],
+            })
+
+        # Theory of Mind
+        person.last_known_state = analysis.user_state
+        person.last_known_intent = analysis.user_intent
+        person.reliability_score = (
+            0.7 * person.reliability_score + 0.3 * analysis.reliability
+        )
+        self._last_user_context = {
+            "state": analysis.user_state,
+            "intent": analysis.user_intent,
+            "reliability": analysis.reliability,
+        }
+
+        if analysis.trust_delta:
+            person.trust += analysis.trust_delta
+            person.clamp()
+        if analysis.warmth_delta:
+            person.warmth += analysis.warmth_delta
+            person.clamp()
+
+        person.familiarity = min(1.0, person.familiarity + 0.02)
+        msg.__dict__["_analysis"] = analysis
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Step 8: Appraise
+    # ------------------------------------------------------------------
+
+    def _appraise(self) -> list[dict[str, Any]]:
+        """Mark-to-market, evaluate predictions, update economic state."""
+        events: list[dict[str, Any]] = []
+        prices = self.state.last_prices
+
+        # 8a. Portfolio mark-to-market + drawdown detection
+        if prices:
+            current_value = self.portfolio.total_value(prices)
+            if self.portfolio.last_total_value is not None:
+                if current_value < self.portfolio.last_total_value * 0.95:
+                    drawdown = (
+                        self.portfolio.last_total_value - current_value
+                    ) / self.portfolio.last_total_value
+                    events.append({
+                        "type": "drawdown",
+                        "intensity": min(0.8, drawdown * 2),
+                        "value": round(drawdown, 4),
+                    })
+
+        # 8b. Starvation warning events
+        warning = self.accountant.starvation_warning()
+        if warning:
+            events.append({
+                "type": "starvation_warning",
+                "level": warning,
+                "capital": self.accountant.operating_capital,
+                "intensity": {"FATAL": 1.0, "CRITICAL": 0.8, "WARNING": 0.5}.get(
+                    warning, 0.3
+                ),
+            })
+
+        # 8c. Update economic state from events
+        daily_budget_pct = (
+            self.accountant.daily_spent / self.accountant.daily_budget
+            if self.accountant.daily_budget > 0
+            else 0.0
+        )
+        drawdown_pct = 0.0
+        if self.portfolio.last_total_value and prices:
+            current_val = self.portfolio.total_value(prices)
+            if current_val < self.portfolio.last_total_value:
+                drawdown_pct = (
+                    self.portfolio.last_total_value - current_val
+                ) / self.portfolio.last_total_value
+
+        update_economic_state(
+            self.economic,
+            events,
+            daily_budget_pct=daily_budget_pct,
+            drawdown_pct=drawdown_pct,
+            sharpe=self.portfolio.sharpe_ratio(),
+        )
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Step 9: Strategize
+    # ------------------------------------------------------------------
+
+    def _strategize(self) -> None:
+        """Generate and prioritize trading objectives."""
+        has_chris = bool(self.state.unprocessed_messages())
+        # Check for messages that just got marked as processed this tick
+        if not has_chris:
+            for m in self.state.pending_messages:
+                if m.processed and hasattr(m, '_analysis'):
+                    analysis = m.__dict__.get('_analysis')
+                    if analysis and analysis.requires_response:
+                        has_chris = True
+                        break
+
+        self.strategy.auto_generate(
+            has_chris_message=has_chris,
+            is_sunday=self.monitor.is_sunday(),
+            market_open=self.monitor.is_market_open(),
+            has_positions=bool(self.portfolio.open_positions()),
+            capital_low=self.accountant.operating_capital < 5,
+            alpha_low=self.economic.alpha < 0.3,
+            tick_count=self.state.tick_count,
+            watchlist_tickers=list(self.monitor.watchlist.keys()),
+        )
+
+        self.strategy.cleanup()
+
+    # ------------------------------------------------------------------
+    # Step 10: Decide
+    # ------------------------------------------------------------------
+
+    def _decide_market(self, events: list[dict]) -> str:
+        """Decide what to do this tick.
+
+        Priority order:
+        1. Always respond to Chris if message pending
+        2. Sunday -> synthesize
+        3. Capital < $5 -> idle (survival mode)
+        4. Open positions + market open -> monitor (check stop-loss/target)
+        5. Market open + budget available -> analyze
+        6. Default -> idle
+        """
+        # 1. Chris message pending?
+        has_response_needed = False
+        for m in self.state.pending_messages:
+            if m.processed and hasattr(m, '_analysis'):
+                analysis = m.__dict__.get('_analysis')
+                if analysis and analysis.requires_response:
+                    has_response_needed = True
+                    break
+
+        if has_response_needed:
+            return "respond_chris"
+
+        # 2. Sunday synthesis
+        if self.monitor.is_sunday():
+            objectives = self.strategy.prioritized()
+            for obj in objectives:
+                if obj.obj_type == "sunday":
+                    return "synthesize"
+
+        # 3. Survival mode
+        if self.accountant.operating_capital < 5:
+            return "idle"
+
+        # 4. Open positions + market open -> monitor
+        if self.portfolio.open_positions() and self.monitor.is_market_open():
+            return "monitor"
+
+        # 5. Market open + budget -> analyze
+        if self.monitor.is_market_open() and not self.accountant.operating_capital < 20:
+            objectives = self.strategy.prioritized()
+            for obj in objectives:
+                if obj.obj_type in ("analyze", "scan"):
+                    return "analyze"
+
+        # 6. Default
+        return "idle"
+
+    # ------------------------------------------------------------------
+    # Step 11: Execute
+    # ------------------------------------------------------------------
+
+    def _execute_market(
+        self, decision: str, affect: AffectState, events: list[dict],
+    ) -> MarketTickResult:
+        """Execute the decision."""
+        result = MarketTickResult(
+            tick=self.state.tick_count,
+            decision=decision,
+        )
+
+        if decision == "respond_chris":
+            self._do_respond_chris(result)
+        elif decision == "analyze":
+            self._do_analyze(result)
+        elif decision == "monitor":
+            self._do_monitor(result)
+        elif decision == "synthesize":
+            self._do_synthesize(result)
+        elif decision == "trade":
+            self._do_trade(result)
+        else:  # idle
+            self._do_market_idle(result)
+
+        return result
+
+    def _do_respond_chris(self, result: MarketTickResult) -> None:
+        """Respond to Chris's message using LLM."""
+        target_msg = None
+        for m in reversed(self.state.pending_messages):
+            analysis = m.__dict__.get('_analysis')
+            if analysis and analysis.requires_response:
+                target_msg = m
+                break
+
+        if not target_msg:
+            result.decision = "idle"
+            result.thinking = "No message to respond to."
+            return
+
+        person = self.state.chris
+        if not person:
+            result.decision = "idle"
+            return
+
+        # Check budget
+        if not self.accountant.should_use_llm("chat", 512):
+            result.thinking = "Budget depleted for chat. Cannot respond."
+            result.outgoing_message = "Acknowledged, Chris. [Budget limit reached]"
+            self.state.add_entity_message("chris", result.outgoing_message)
+            self._clear_analyses()
+            return
+
+        # Build context
+        emotions_text = self._market_emotions_text()
+        portfolio_text = self._portfolio_text()
+        market_text = self.monitor.ground_truth_text()
+        research_text = self._research_text()
+        conversation_text = self._conversation_text("chris")
+        ground_truth = self.state.ground_truth_text(
+            market_text=market_text,
+            portfolio_text=portfolio_text,
+            capital_text=self._capital_text(),
+        )
+
+        brain_result = respond_to_chris(
+            entity_name=self.state.name,
+            message=target_msg.text,
+            emotions_text=emotions_text,
+            portfolio_text=portfolio_text,
+            market_text=market_text,
+            research_text=research_text,
+            conversation_text=conversation_text,
+            ground_truth=ground_truth,
+            accountant=self.accountant,
+            personality=self._personality_text(),
+        )
+
+        result.thinking = brain_result.thinking
+        result.target_person_id = "chris"
+
+        if brain_result.response:
+            result.outgoing_message = brain_result.response
+            self.state.add_entity_message("chris", brain_result.response)
+            person.last_interaction_time = time.time()
+
+        self._clear_analyses()
+
+    def _do_analyze(self, result: MarketTickResult) -> None:
+        """Analyze a ticker from the watchlist using LLM."""
+        # Pick a ticker to analyze
+        objectives = self.strategy.prioritized()
+        ticker = None
+        obj_id = None
+        for obj in objectives:
+            if obj.obj_type in ("analyze", "scan") and obj.ticker:
+                ticker = obj.ticker
+                obj_id = obj.id
+                break
+
+        if not ticker:
+            # Pick from watchlist round-robin
+            tickers = list(self.monitor.watchlist.keys())
+            if tickers:
+                ticker = tickers[self.state.tick_count % len(tickers)]
+            else:
+                result.thinking = "Nothing to analyze. Watchlist empty."
+                result.decision = "idle"
+                return
+
+        # Check budget
+        if not self.accountant.should_use_llm("analysis", 256):
+            result.thinking = f"Budget depleted for analysis. Skipping {ticker}."
+            result.decision = "idle"
+            return
+
+        # Gather data
+        entry = self.monitor.watchlist.get(ticker)
+        price_data = ""
+        if entry and entry.last_price is not None:
+            price_data = f"Current price: ${entry.last_price:.2f}"
+            if entry.price_history:
+                changes = [
+                    f"{s.change_pct:+.1f}%" for s in entry.price_history[-5:]
+                ]
+                price_data += f"\nRecent changes: {', '.join(changes)}"
+
+        fundamentals = ""
+        if entry and entry.fundamentals:
+            parts = []
+            for k, v in entry.fundamentals.items():
+                if v is not None and k not in ("sector", "industry", "name"):
+                    parts.append(f"{k}: {v}")
+            fundamentals = "\n".join(parts[:10])
+
+        news_items = self.news.recent_for_ticker(ticker, limit=3)
+        news_text = "\n".join(f"- {n.title}" for n in news_items) if news_items else ""
+
+        analysis = analyze_market_data(
+            ticker=ticker,
+            price_data=price_data or "No price data available.",
+            fundamentals=fundamentals or "No fundamentals available.",
+            news_text=news_text,
+            accountant=self.accountant,
+            personality=self._personality_text(),
+        )
+
+        if analysis.used_llm:
+            result.thinking = (
+                f"Analyzed {ticker}: {analysis.thesis} "
+                f"(conviction={analysis.conviction:.1f}, action={analysis.action})"
+            )
+            # Record research note
+            if analysis.thesis:
+                self.research.add_note(
+                    ticker=ticker,
+                    content=analysis.thesis,
+                    note_type="thesis" if analysis.conviction > 0.6 else "observation",
+                    conviction=analysis.conviction,
+                    source="analysis",
+                )
+
+            # If high conviction, consider trade
+            if analysis.action in ("buy", "sell") and analysis.conviction > 0.6:
+                result.trade_action = analysis.action
+                result.trade_ticker = ticker
+                # Execute trade reasoning
+                self._maybe_trade(result, ticker, analysis.thesis)
+        else:
+            result.thinking = f"Analysis of {ticker} failed (LLM unavailable)."
+            result.decision = "idle"
+
+        # Complete the objective
+        if obj_id:
+            self.strategy.complete_objective(obj_id)
+
+    def _maybe_trade(
+        self, result: MarketTickResult, ticker: str, thesis: str,
+    ) -> None:
+        """Use trade reasoner to decide whether to execute."""
+        if not self.accountant.should_use_llm("trading", 512):
+            result.thinking += " [Trade reasoning skipped: budget limit]"
+            return
+
+        portfolio_text = self._portfolio_text()
+        market_text = self.monitor.ground_truth_text()
+
+        trade_decision = reason_trade(
+            ticker=ticker,
+            thesis=thesis,
+            portfolio_text=portfolio_text,
+            market_context=market_text,
+            accountant=self.accountant,
+            personality=self._personality_text(),
+        )
+
+        if trade_decision.used_llm and trade_decision.action in ("buy", "sell"):
+            result.trade_action = trade_decision.action
+            result.thinking += (
+                f" Trade: {trade_decision.action} {trade_decision.shares} shares "
+                f"(confidence={trade_decision.confidence:.1f})"
+            )
+
+            # Execute the trade
+            price = self.state.last_prices.get(ticker)
+            if price and trade_decision.action == "buy" and trade_decision.shares > 0:
+                position = self.portfolio.execute_buy(
+                    ticker, price, trade_decision.shares,
+                    rationale=trade_decision.rationale,
+                )
+                if position:
+                    result.thinking += f" -> Bought at ${price:.2f}"
+                    # Record rationale
+                    self.research.add_rationale(TradeRationale(
+                        trade_id=position.id,
+                        ticker=ticker,
+                        direction="long",
+                        thesis=thesis,
+                        conviction=trade_decision.confidence,
+                        stop_loss=trade_decision.stop_loss or None,
+                        target=trade_decision.target or None,
+                    ))
+                    # Register prediction
+                    if trade_decision.target:
+                        self.trade_predictions.register_trade_prediction(
+                            ticker=ticker,
+                            direction="long",
+                            entry_price=price,
+                            target_price=trade_decision.target,
+                            conviction=trade_decision.confidence,
+                        )
+                else:
+                    result.thinking += " -> Buy failed (insufficient funds or limit)"
+
+            elif price and trade_decision.action == "sell":
+                pnl = self.portfolio.execute_sell(
+                    ticker, price, rationale=trade_decision.rationale,
+                )
+                if pnl is not None:
+                    result.trade_pnl = pnl
+                    result.thinking += f" -> Sold at ${price:.2f}, P&L: ${pnl:.2f}"
+                    # Post-mortem
+                    self._record_post_mortem(ticker, pnl)
+
+    def _do_monitor(self, result: MarketTickResult) -> None:
+        """Monitor open positions for stop-loss/target hits."""
+        positions = self.portfolio.open_positions()
+        if not positions:
+            result.thinking = "No open positions to monitor."
+            result.decision = "idle"
+            return
+
+        lines = []
+        for pos in positions:
+            price = self.state.last_prices.get(pos.ticker, pos.entry_price)
+            pnl = pos.unrealized_pnl(price)
+            pnl_pct = ((price - pos.entry_price) / pos.entry_price * 100
+                       if pos.entry_price else 0)
+            lines.append(
+                f"{pos.ticker}: ${price:.2f} (P&L: ${pnl:.2f} / {pnl_pct:+.1f}%)"
+            )
+
+            # Check stop-loss from rationale
+            rationale = self.research.rationale_for_trade(pos.id)
+            if rationale and rationale.stop_loss and price <= rationale.stop_loss:
+                # Stop-loss hit -> sell
+                sell_pnl = self.portfolio.execute_sell(
+                    pos.ticker, price, rationale="Stop-loss triggered",
+                )
+                if sell_pnl is not None:
+                    result.trade_pnl = sell_pnl
+                    result.trade_action = "sell"
+                    result.trade_ticker = pos.ticker
+                    lines.append(f"  STOP-LOSS HIT -> Sold, P&L: ${sell_pnl:.2f}")
+                    self._record_post_mortem(pos.ticker, sell_pnl)
+
+            # Check target
+            if rationale and rationale.target and price >= rationale.target:
+                sell_pnl = self.portfolio.execute_sell(
+                    pos.ticker, price, rationale="Target reached",
+                )
+                if sell_pnl is not None:
+                    result.trade_pnl = sell_pnl
+                    result.trade_action = "sell"
+                    result.trade_ticker = pos.ticker
+                    lines.append(f"  TARGET HIT -> Sold, P&L: ${sell_pnl:.2f}")
+                    self._record_post_mortem(pos.ticker, sell_pnl)
+
+        result.thinking = "Monitoring: " + "; ".join(lines)
+
+    def _do_synthesize(self, result: MarketTickResult) -> None:
+        """Sunday strategic synthesis using LLM."""
+        if not self.accountant.should_use_llm("synthesis", 1024):
+            result.thinking = "Budget depleted for synthesis."
+            result.decision = "idle"
+            return
+
+        portfolio_text = self._portfolio_text()
+        research_text = self._research_text()
+        performance_text = self._performance_text()
+        lessons = self.research.recent_lessons(limit=5)
+        lessons_text = "\n".join(f"- {l}" for l in lessons) if lessons else "None."
+
+        synthesis = strategic_synthesis(
+            portfolio_text=portfolio_text,
+            research_text=research_text,
+            performance_text=performance_text,
+            lessons_text=lessons_text,
+            accountant=self.accountant,
+            personality=self._personality_text(),
+        )
+
+        if synthesis.used_llm:
+            result.thinking = f"Sunday Synthesis: {synthesis.summary}"
+
+            # Record weekly review
+            self.research.add_weekly_review({
+                "summary": synthesis.summary,
+                "watchlist_changes": synthesis.watchlist_changes,
+                "research_notes": synthesis.research_notes,
+                "adjustments": synthesis.adjustments,
+            })
+
+            # Apply watchlist changes
+            for change in synthesis.watchlist_changes:
+                parts = change.split()
+                if len(parts) >= 2:
+                    action, ticker = parts[0].lower(), parts[1]
+                    if action == "add":
+                        self.monitor.add_ticker(ticker)
+                    elif action == "remove":
+                        self.monitor.remove_ticker(ticker)
+
+            # Complete sunday objectives
+            for obj in self.strategy.objectives:
+                if obj.obj_type == "sunday" and not obj.completed:
+                    self.strategy.complete_objective(obj.id)
+                    break
+        else:
+            result.thinking = "Sunday synthesis failed (LLM unavailable)."
+            result.decision = "idle"
+
+    def _do_trade(self, result: MarketTickResult) -> None:
+        """Execute a trade decision."""
+        result.thinking = "Trade execution deferred to analyze step."
+        result.decision = "idle"
+
+    def _do_market_idle(self, result: MarketTickResult) -> None:
+        """Background micro-thought (no LLM cost)."""
+        result.thinking = self._market_micro_thought()
+
+    # ------------------------------------------------------------------
+    # Post-mortem
+    # ------------------------------------------------------------------
+
+    def _record_post_mortem(self, ticker: str, pnl: float) -> None:
+        """Record a post-mortem for a closed trade."""
+        # Find the position in trade history
+        position = None
+        for p in reversed(self.portfolio.trade_history):
+            if p.ticker == ticker and not p.is_open:
+                position = p
+                break
+
+        if position:
+            pm = PostMortem(
+                trade_id=position.id,
+                ticker=ticker,
+                entry_price=position.entry_price,
+                exit_price=position.exit_price or 0,
+                pnl=pnl,
+                what_went_right=["Executed trade"] if pnl > 0 else [],
+                what_went_wrong=["Trade lost money"] if pnl < 0 else [],
+                lessons=[
+                    f"{'Profitable' if pnl > 0 else 'Loss'} trade on {ticker}: "
+                    f"${pnl:.2f}"
+                ],
+            )
+            self.research.add_post_mortem(pm)
+
+            # Resolve trade prediction
+            if position.exit_price:
+                self.trade_predictions.resolve_trade_prediction(
+                    ticker, position.exit_price, pnl,
+                )
+
+    # ------------------------------------------------------------------
+    # Market-specific helpers
+    # ------------------------------------------------------------------
+
+    def _market_micro_thought(self) -> str:
+        """Ultra-short thought based on market state (no LLM)."""
+        seeds: list[str] = []
+
+        # Capital awareness
+        cap = self.accountant.operating_capital
+        if cap < 10:
+            seeds.append(f"Capital critical: ${cap:.2f}. Must conserve.")
+        elif cap < 50:
+            seeds.append(f"Running low: ${cap:.2f}. Be selective.")
+
+        # Position awareness
+        positions = self.portfolio.open_positions()
+        if positions:
+            for p in positions[:2]:
+                price = self.state.last_prices.get(p.ticker, p.entry_price)
+                pnl = p.unrealized_pnl(price)
+                seeds.append(f"{p.ticker}: ${pnl:+.2f} unrealized.")
+
+        # Market state
+        if self.monitor.is_market_open():
+            seeds.append("Markets open. Watching for opportunities.")
+        elif self.monitor.is_sunday():
+            seeds.append("Sunday. Time for strategic review.")
+        else:
+            seeds.append("Markets closed. Planning next moves.")
+
+        # Economic state
+        if self.economic.alpha < 0.3:
+            seeds.append("Need alpha. Time for deeper research.")
+        if self.economic.cost_pressure > 0.7:
+            seeds.append("Token costs high. Being more selective.")
+
+        # Mood
+        mood = self.emotions.dominant_mood()
+        mood_thoughts = {
+            "anxious": "Uneasy about positions.",
+            "optimistic": "Feeling good about the thesis.",
+            "irritable": "Markets testing patience.",
+            "convicted": "High conviction. Stay disciplined.",
+            "cautious": "Proceed carefully.",
+        }
+        if mood in mood_thoughts:
+            seeds.append(mood_thoughts[mood])
+
+        if not seeds:
+            seeds.append("Monitoring. Waiting for signals.")
+
+        return random.choice(seeds)
+
+    def _extract_market_themes(self, result: MarketTickResult) -> list[str]:
+        """Extract themes from market tick output."""
+        themes: list[str] = []
+        text = (result.thinking or "") + " " + (result.outgoing_message or "")
+        text_lower = text.lower()
+
+        # Ticker mentions
+        for ticker in self.monitor.watchlist:
+            if ticker.lower() in text_lower:
+                themes.append(f"ticker:{ticker}")
+
+        # Trade actions
+        if result.trade_action:
+            themes.append(f"trade:{result.trade_action}")
+
+        # Decision type
+        if result.decision not in ("idle",):
+            themes.append(f"decision:{result.decision}")
+
+        return themes
+
+    def _create_market_action_events(
+        self, result: MarketTickResult,
+    ) -> list[dict[str, Any]]:
+        """Generate events from the entity's own market actions."""
+        events: list[dict[str, Any]] = []
+
+        if result.trade_pnl is not None:
+            if result.trade_pnl > 0:
+                events.append({
+                    "type": "trade_profit",
+                    "ticker": result.trade_ticker,
+                    "pnl": result.trade_pnl,
+                    "intensity": min(0.8, abs(result.trade_pnl) / 100),
+                })
+            else:
+                events.append({
+                    "type": "trade_loss",
+                    "ticker": result.trade_ticker,
+                    "pnl": result.trade_pnl,
+                    "intensity": min(0.8, abs(result.trade_pnl) / 100),
+                })
+
+        if result.decision == "respond_chris" and result.outgoing_message:
+            events.append({
+                "type": "entity_spoke",
+                "person": "Chris",
+                "text": result.outgoing_message[:100],
+                "intensity": 0.2,
+            })
+
+        # Self-judgment: irritable when speaking to Chris
+        if (result.decision == "respond_chris"
+                and result.outgoing_message
+                and self.emotions.irritability > 0.5):
+            events.append({
+                "type": "self_judgment",
+                "subtype": "sharp_response",
+                "person": "Chris",
+                "intensity": min(0.5, self.emotions.irritability),
+            })
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Text builders for LLM prompts
+    # ------------------------------------------------------------------
+
+    def _market_emotions_text(self) -> str:
+        mood = self.emotions.dominant_mood()
+        eco = self.economic.deficit_summary()
+        eco_line = f"Economic state: {eco}" if eco != "no critical deficits" else "Economic state: healthy"
+        return (
+            f"Dominant mood: {mood}\n"
+            f"Conviction: {self.emotions.conviction:.2f}\n"
+            f"Caution: {self.emotions.caution:.2f}\n"
+            f"Anxiety: {self.emotions.anxiety:.2f}\n"
+            f"Risk tolerance: {self.emotions.risk_tolerance:.2f}\n"
+            f"Optimism: {self.emotions.optimism:.2f}\n"
+            f"{eco_line}"
+        )
+
+    def _portfolio_text(self) -> str:
+        prices = self.state.last_prices
+        lines = [f"Cash: ${self.portfolio.cash:.2f}"]
+        lines.append(f"Total value: ${self.portfolio.total_value(prices):.2f}")
+
+        positions = self.portfolio.open_positions()
+        if positions:
+            lines.append(f"Open positions ({len(positions)}):")
+            for p in positions:
+                price = prices.get(p.ticker, p.entry_price)
+                pnl = p.unrealized_pnl(price)
+                lines.append(
+                    f"  {p.ticker}: {p.shares} shares @ ${p.entry_price:.2f} "
+                    f"(now ${price:.2f}, P&L: ${pnl:.2f})"
+                )
+        else:
+            lines.append("No open positions.")
+
+        wr = self.portfolio.win_rate()
+        sharpe = self.portfolio.sharpe_ratio()
+        total_pnl = self.portfolio.total_realized_pnl()
+        if self.portfolio.trade_history:
+            lines.append(
+                f"Win rate: {wr:.0%} | Sharpe: {sharpe or 'N/A'} | "
+                f"Total P&L: ${total_pnl:.2f}"
+            )
+
+        return "\n".join(lines)
+
+    def _capital_text(self) -> str:
+        a = self.accountant
+        return (
+            f"Operating capital: ${a.operating_capital:.2f}\n"
+            f"Total spent: ${a.total_spent:.4f}\n"
+            f"Daily budget: ${a.daily_budget:.4f}\n"
+            f"Daily spent: ${a.daily_spent:.4f}"
+        )
+
+    def _research_text(self) -> str:
+        theses = self.research.active_theses()
+        if not theses:
+            return "No active research theses."
+        lines = ["Active theses:"]
+        for t in theses[-5:]:
+            lines.append(
+                f"  {t.ticker}: {t.content[:80]} "
+                f"(conviction={t.conviction:.1f})"
+            )
+        return "\n".join(lines)
+
+    def _performance_text(self) -> str:
+        lines = []
+        lines.append(f"Total trades: {len(self.portfolio.trade_history)}")
+        lines.append(f"Win rate: {self.portfolio.win_rate():.0%}")
+        sharpe = self.portfolio.sharpe_ratio()
+        lines.append(f"Sharpe ratio: {sharpe or 'N/A'}")
+        lines.append(f"Total P&L: ${self.portfolio.total_realized_pnl():.2f}")
+
+        accuracy = self.trade_predictions.direction_accuracy()
+        if accuracy is not None:
+            lines.append(f"Direction accuracy: {accuracy:.0%}")
+
+        return "\n".join(lines)
+
+    def _conversation_text(self, person_id: str) -> str:
+        recent = self.state.recent_conversation(person_id, limit=8)
+        if not recent:
+            return "(no prior conversation)"
+        lines = []
+        for msg in recent:
+            role = "Chris" if msg["role"] == "human" else "You"
+            lines.append(f"{role}: {msg['text']}")
+        return "\n".join(lines)
+
+    def _personality_text(self) -> str:
+        if self.identity.personality:
+            return f"\n{self.identity.personality}\n"
+        return ""
+
+    def _clear_analyses(self) -> None:
+        """Clear analysis metadata from processed messages."""
+        for m in self.state.pending_messages:
+            m.__dict__.pop('_analysis', None)
+
+    # ------------------------------------------------------------------
+    # Debug / state dump
+    # ------------------------------------------------------------------
+
+    def debug_state(self) -> dict[str, Any]:
+        """Full state dump for debug/API endpoints."""
+        prices = self.state.last_prices
+        return {
+            "tick": self.state.tick_count,
+            "energy": self.state.energy,
+            "emotions": self.emotions.to_dict(),
+            "dominant_mood": self.emotions.dominant_mood(),
+            "economic_state": self.economic.to_dict(),
+            "capital": self.accountant.summary(),
+            "portfolio": self.portfolio.summary(prices),
+            "market_session": self.monitor.market_session_label(),
+            "watchlist": {
+                ticker: {
+                    "price": e.last_price,
+                    "exchange": e.exchange,
+                }
+                for ticker, e in self.monitor.watchlist.items()
+            },
+            "research": self.research.summary(),
+            "strategy": {
+                "objectives": [
+                    o.to_dict() for o in self.strategy.prioritized()[:5]
+                ],
+            },
+            "trade_predictions": {
+                "direction_accuracy": self.trade_predictions.direction_accuracy(),
+                "avg_error": self.trade_predictions.average_prediction_error(),
+            },
+            "last_thinking": self.last_thinking,
+            "last_decision": self.last_decision,
+            "thinking_history": self.thinking_history[-20:],
+            "is_alive": self.accountant.is_alive(),
+            "starvation_warning": self.accountant.starvation_warning(),
+        }

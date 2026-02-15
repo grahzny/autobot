@@ -32,6 +32,16 @@ class Identity:
     seed_goal: str = ""                 # initial purpose/goal
     seed_goal_category: str = "self"    # goal category
 
+    # --- Market entity config ---
+    starting_capital: float = 1000.00
+    timezone: str = "Australia/Melbourne"
+    token_cost_input: float = 3.00      # $/1M input tokens
+    token_cost_output: float = 15.00    # $/1M output tokens
+    brokerage_fee: float = 6.00
+    slippage_pct: float = 0.0005        # 0.05%
+    max_position_pct: float = 0.20      # max 20% of portfolio per position
+    seed_watchlist: list[str] = field(default_factory=list)
+
     @classmethod
     def default(cls) -> Identity:
         """Return default identity (backward-compatible empty state)."""
@@ -88,4 +98,12 @@ class Identity:
             seed_interests=[str(s) for s in data.get("seed_interests", [])],
             seed_goal=str(data.get("seed_goal", "")),
             seed_goal_category=str(data.get("seed_goal_category", "self")),
+            starting_capital=float(data.get("starting_capital", 1000.00)),
+            timezone=str(data.get("timezone", "Australia/Melbourne")),
+            token_cost_input=float(data.get("token_cost_input", 3.00)),
+            token_cost_output=float(data.get("token_cost_output", 15.00)),
+            brokerage_fee=float(data.get("brokerage_fee", 6.00)),
+            slippage_pct=float(data.get("slippage_pct", 0.0005)),
+            max_position_pct=float(data.get("max_position_pct", 0.20)),
+            seed_watchlist=[str(s) for s in data.get("seed_watchlist", [])],
         )

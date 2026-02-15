@@ -1,4 +1,9 @@
-"""Emotional system: fast affect (amygdala) + reflective emotion layer."""
+"""Emotional system: fast affect (amygdala) + reflective emotion layer.
+
+Market-linked version: triggers are market events (trade P&L, volatility,
+cost pressure, news) rather than social interactions. The dual-layer
+architecture (fast affect + slow reflective) is preserved.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from autobot.chat_state import ChatState
-    from autobot.needs import NeedsState
+    from autobot.needs import EconomicState
 
 
 # ======================================================================
@@ -30,41 +34,36 @@ class AffectState:
         self.attention_focus = None
 
 
-# Trigger thresholds
-_TRUST_DROP_THRESHOLD = -0.1
-_TRUST_GAIN_THRESHOLD = 0.1
-
 # Trigger patterns: event_type -> (arousal_delta, valence_delta, tag)
 _AFFECT_TRIGGERS: dict[str, tuple[float, float, str]] = {
-    # --- Carried from simulation (still useful) ---
-    "praise_given":          (0.3,  0.5, "praise"),
-    "information_refused":   (0.4, -0.3, "uncertainty"),
-    "accusation_made":       (0.5, -0.4, "conflict"),
+    # --- Trade outcomes ---
+    "trade_profit":          (0.4,  0.5, "profit"),
+    "trade_loss":            (0.5, -0.5, "loss"),
 
-    # --- Chat-specific triggers ---
-    "reconnection":          (0.2,  0.3, "reconnection"),
-    "being_ignored":         (0.3, -0.3, "neglect"),
-    "new_encounter":         (0.4,  0.2, "novelty"),
-    "meaningful_exchange":   (0.3,  0.4, "depth"),
-    "vulnerability_shared":  (0.4,  0.4, "intimacy"),
-    "boundary_crossed":      (0.6, -0.5, "violation"),
-    "boredom":               (0.15, -0.15, "stagnation"),
-    "restlessness":          (0.25, -0.1, "restless"),
-    "loneliness":            (0.4, -0.3, "isolation"),
-    "humor":                 (0.2,  0.4, "levity"),
-    "disagreement":          (0.4, -0.3, "friction"),
-    "agreement":             (0.2,  0.3, "harmony"),
-    "compliment_received":   (0.3,  0.5, "appreciation"),
-    "criticism_received":    (0.5, -0.4, "criticism"),
-    "personal_question":     (0.3,  0.1, "curiosity"),
-    "dismissive_tone":       (0.3, -0.2, "rejection"),
-    "enthusiasm_shared":     (0.3,  0.4, "excitement"),
-    "farewell":              (0.2, -0.1, "parting"),
-    "greeting":              (0.2,  0.2, "hello"),
+    # --- Market signals ---
+    "price_alert":           (0.4,  0.0, "alert"),
+    "news_positive":         (0.2,  0.3, "opportunity"),
+    "news_negative":         (0.3, -0.3, "risk"),
 
-    # --- Self-generated action triggers ---
-    "entity_spoke":          (0.1,  0.2, "expression"),
-    "entity_initiated":      (0.15, 0.2, "initiative"),
+    # --- Thesis lifecycle ---
+    "thesis_confirmed":      (0.3,  0.4, "validation"),
+    "thesis_invalidated":    (0.4, -0.4, "invalidation"),
+    "high_conviction_research": (0.2, 0.3, "insight"),
+
+    # --- Prediction outcomes ---
+    "prediction_accurate":   (0.2,  0.3, "accuracy"),
+    "prediction_wrong":      (0.3, -0.3, "error"),
+
+    # --- Economic pressure ---
+    "starvation_warning":    (0.6, -0.5, "survival"),
+    "drawdown":              (0.5, -0.4, "drawdown"),
+    "recovery":              (0.3,  0.3, "recovery"),
+
+    # --- Chris interaction ---
+    "chris_message":         (0.2,  0.2, "chris"),
+    "chris_insight":         (0.3,  0.4, "chris_insight"),
+
+    # --- Self-generated ---
     "self_reflection":       (0.1,  0.1, "introspection"),
     "idle_thought":          (0.05, 0.0, "rumination"),
     "self_judgment":         (0.3, -0.3, "self_criticism"),
@@ -73,7 +72,7 @@ _AFFECT_TRIGGERS: dict[str, tuple[float, float, str]] = {
 
 def evaluate_amygdala(
     events: list[dict[str, Any]],
-    state: ChatState,
+    state: Any = None,  # MarketState (optional for backward compat)
 ) -> AffectState:
     """
     Scan cycle events for emotional triggers.
@@ -87,27 +86,22 @@ def evaluate_amygdala(
         # Pattern-matched triggers
         if etype in _AFFECT_TRIGGERS:
             a_delta, v_delta, tag = _AFFECT_TRIGGERS[etype]
-            affect.arousal = min(1.0, affect.arousal + a_delta)
-            affect.valence = max(-1.0, min(1.0, affect.valence + v_delta))
+            # Scale by intensity if provided
+            intensity = ev.get("intensity", 1.0)
+            affect.arousal = min(1.0, affect.arousal + a_delta * intensity)
+            affect.valence = max(-1.0, min(1.0, affect.valence + v_delta * intensity))
             affect.salience_tags.append(tag)
 
-        # Trust-change trigger (from message analysis)
-        if etype == "trust_change":
-            delta = ev.get("delta", 0)
-            if delta <= _TRUST_DROP_THRESHOLD:
-                affect.arousal = min(1.0, affect.arousal + 0.5)
-                affect.valence = max(-1.0, affect.valence - 0.5)
-                affect.salience_tags.append("trust_drop")
-                affect.attention_focus = ev.get("person", ev.get("npc"))
-            elif delta >= _TRUST_GAIN_THRESHOLD:
+        # Trade P&L magnitude scaling
+        if etype in ("trade_profit", "trade_loss"):
+            pnl = ev.get("pnl", 0)
+            if abs(pnl) > 50:  # big trade
                 affect.arousal = min(1.0, affect.arousal + 0.2)
-                affect.valence = min(1.0, affect.valence + 0.3)
-                affect.salience_tags.append("trust_gain")
 
-    # Set attention focus to most salient entity if not already set
+    # Set attention focus to most salient ticker/entity
     if not affect.attention_focus and affect.salience_tags:
         for ev in events:
-            for key in ("person", "target", "npc"):
+            for key in ("ticker", "person", "target"):
                 if key in ev:
                     affect.attention_focus = ev[key]
                     break
@@ -123,17 +117,36 @@ def evaluate_amygdala(
 
 @dataclass
 class EmotionalState:
-    """Slow-moving reflective emotions -- persists across cycles."""
+    """Slow-moving reflective emotions -- persists across cycles.
+
+    Market-adapted fields:
+    - conviction (was social_warmth): confidence in positions/theses
+    - caution (was avoidance_bias): tendency to wait rather than act
+    """
     anxiety: float = 0.0           # 0-1
     optimism: float = 0.5          # 0-1
     irritability: float = 0.0      # 0-1
-    social_warmth: float = 0.5     # 0-1
-    avoidance_bias: float = 0.0    # 0-1, tendency to avoid engagement
+    conviction: float = 0.5        # 0-1, confidence in positions
+    caution: float = 0.2           # 0-1, tendency to wait
     risk_tolerance: float = 0.5    # 0-1
+
+    # Backward-compat aliases for code that still uses old names
+    @property
+    def social_warmth(self) -> float:
+        return self.conviction
+    @social_warmth.setter
+    def social_warmth(self, v: float) -> None:
+        self.conviction = v
+    @property
+    def avoidance_bias(self) -> float:
+        return self.caution
+    @avoidance_bias.setter
+    def avoidance_bias(self, v: float) -> None:
+        self.caution = v
 
     def clamp(self) -> None:
         for attr in ("anxiety", "optimism", "irritability",
-                     "social_warmth", "avoidance_bias", "risk_tolerance"):
+                     "conviction", "caution", "risk_tolerance"):
             val = max(0.0, min(1.0, getattr(self, attr)))
             setattr(self, attr, round(val, 3))
 
@@ -142,8 +155,8 @@ class EmotionalState:
             "anxiety": self.anxiety,
             "optimism": self.optimism,
             "irritability": self.irritability,
-            "social_warmth": self.social_warmth,
-            "avoidance_bias": self.avoidance_bias,
+            "conviction": self.conviction,
+            "caution": self.caution,
             "risk_tolerance": self.risk_tolerance,
         }
 
@@ -152,8 +165,8 @@ class EmotionalState:
             "anxious": self.anxiety,
             "optimistic": self.optimism,
             "irritable": self.irritability,
-            "warm": self.social_warmth,
-            "avoidant": self.avoidance_bias,
+            "convicted": self.conviction,
+            "cautious": self.caution,
         }
         return max(moods, key=moods.get)  # type: ignore[arg-type]
 
@@ -164,24 +177,20 @@ _BASELINE = {
     "anxiety": 0.1,
     "optimism": 0.5,
     "irritability": 0.1,
-    "social_warmth": 0.5,
-    "avoidance_bias": 0.1,
+    "conviction": 0.5,
+    "caution": 0.2,
     "risk_tolerance": 0.5,
 }
 
 
 def apply_emotional_weather(state: EmotionalState, tick_count: int) -> None:
-    """Slow sinusoidal oscillation to prevent perfectly stable moods.
-
-    Uses overlapping sine waves at different frequencies for each dimension.
-    Amplitude is small (0.03-0.05) so it's a gentle drift, not chaos.
-    """
-    t = tick_count * 0.1  # scale ticks to a reasonable frequency
+    """Slow sinusoidal oscillation to prevent perfectly stable moods."""
+    t = tick_count * 0.1
     state.anxiety += 0.04 * math.sin(t * 0.7 + 1.0)
     state.optimism += 0.05 * math.sin(t * 0.5)
     state.irritability += 0.03 * math.sin(t * 0.9 + 2.0)
-    state.social_warmth += 0.04 * math.sin(t * 0.6 + 3.0)
-    state.avoidance_bias += 0.03 * math.sin(t * 0.8 + 4.0)
+    state.conviction += 0.04 * math.sin(t * 0.6 + 3.0)
+    state.caution += 0.03 * math.sin(t * 0.8 + 4.0)
     state.risk_tolerance += 0.04 * math.sin(t * 0.4 + 5.0)
     state.clamp()
 
@@ -189,38 +198,39 @@ def apply_emotional_weather(state: EmotionalState, tick_count: int) -> None:
 def update_reflective_emotions(
     state: EmotionalState,
     affect: AffectState,
-    cs: ChatState,
-    needs: NeedsState | None = None,
+    cs: Any,  # MarketState or ChatState
+    needs: EconomicState | None = None,
     prediction_error: float | None = None,
     user_context: dict[str, Any] | None = None,
 ) -> EmotionalState:
     """
     Update reflective emotions based on:
-    - Needs deficits (can override baselines)
+    - Economic state deficits
     - Current fast affect
     - Prediction error from recent actions
-    - Theory of Mind (user_context: state, intent, reliability)
-    - Relationship trends
+    - Chris context (user_context)
     - Energy level
-    - Social isolation
+    - Market inactivity
     """
-    # --- Needs deficits override baselines ---
+    # --- Economic state deficits ---
     if needs:
-        if needs.stimulation < 0.3:
+        # Low alpha (meaning) -> frustration
+        if needs.alpha < 0.3:
             state.irritability += 0.06
             state.optimism -= 0.04
-        if needs.belonging < 0.3:
+        # Low ROI (competence) -> anxiety + doubt
+        if needs.roi < 0.3:
             state.anxiety += 0.05
-            state.social_warmth += 0.04  # craving, not satisfaction
-        if needs.meaning < 0.3:
-            state.anxiety += 0.04
-            state.optimism -= 0.05
-        if needs.competence < 0.3:
+            state.conviction -= 0.04
+        # High volatility (market anxiety)
+        if needs.volatility > 0.7:
             state.anxiety += 0.05
-            state.irritability += 0.03
-        if needs.autonomy < 0.3:
+            state.caution += 0.04
+            state.risk_tolerance -= 0.03
+        # High cost pressure
+        if needs.cost_pressure > 0.7:
             state.irritability += 0.04
-            state.avoidance_bias += 0.05
+            state.caution += 0.05
 
     # --- Prediction error modulation ---
     if prediction_error is not None:
@@ -231,35 +241,35 @@ def update_reflective_emotions(
         elif prediction_error > 0.2:  # better than expected
             state.optimism += 0.08
             state.anxiety -= 0.04
-            state.social_warmth += 0.04
+            state.conviction += 0.04
 
-    # --- ToM-aware modulation ---
+    # --- Chris context (ToM-aware modulation) ---
     if user_context:
         u_state = user_context.get("state", "")
         u_intent = user_context.get("intent", "")
         u_reliability = user_context.get("reliability", 0.8)
 
-        # Empathy: venting/hurting user → warmth UP (not offense)
+        # Chris venting -> supportive mode
         if u_state in ("stressed", "hurting", "vulnerable") and u_intent == "venting":
-            state.social_warmth += 0.06
+            state.conviction += 0.06
             state.anxiety += 0.02
             state.irritability = max(0.0, state.irritability - 0.02)
 
-        # Boundary: low reliability + nice surface → suspicion
+        # Low reliability + nice surface -> suspicion
         if u_reliability < 0.4 and affect.valence > 0.2:
-            state.avoidance_bias += 0.04
+            state.caution += 0.04
             state.anxiety += 0.03
-            state.social_warmth -= 0.02
+            state.conviction -= 0.02
             state.risk_tolerance -= 0.03
 
-        # Vulnerability response: genuine vulnerability → open up
+        # Genuine vulnerability -> open up
         if u_state == "vulnerable" and u_reliability > 0.7:
-            state.social_warmth += 0.05
+            state.conviction += 0.05
             state.risk_tolerance += 0.02
 
-        # Hostility: hostile user or confrontation → defensive
+        # Hostility -> defensive
         if u_state == "hostile" or u_intent == "confronting":
-            state.avoidance_bias += 0.05
+            state.caution += 0.05
             state.anxiety += 0.04
             state.irritability += 0.03
 
@@ -268,70 +278,50 @@ def update_reflective_emotions(
         state.anxiety += 0.1 * affect.arousal
         state.irritability += 0.05 * affect.arousal
         state.risk_tolerance -= 0.05
-        state.avoidance_bias += 0.05
+        state.caution += 0.05
 
     if affect.valence > 0.3:
         state.optimism += 0.08 * affect.arousal
-        state.social_warmth += 0.04
+        state.conviction += 0.04
         state.anxiety -= 0.03
         state.risk_tolerance += 0.03
 
-    # --- Relationship trend ---
-    recent_trust_events = [
-        e for e in cs.history[-20:]
-        if e.get("type") == "trust_change"
-    ]
-    if recent_trust_events:
-        avg_delta = sum(e.get("delta", 0) for e in recent_trust_events) / len(
-            recent_trust_events
-        )
-        if avg_delta < -0.05:
-            state.anxiety += 0.05
-            state.social_warmth -= 0.03
-        elif avg_delta > 0.05:
-            state.optimism += 0.04
-            state.social_warmth += 0.03
+    # --- Market-specific triggers ---
+    if "profit" in affect.salience_tags:
+        state.conviction += 0.06
+        state.optimism += 0.05
+    if "loss" in affect.salience_tags:
+        state.conviction -= 0.06
+        state.caution += 0.04
+    if "survival" in affect.salience_tags:
+        state.caution += 0.08
+        state.risk_tolerance -= 0.06
+    if "drawdown" in affect.salience_tags:
+        state.anxiety += 0.06
+        state.risk_tolerance -= 0.04
 
     # --- Energy level ---
-    if cs.energy < 0.2:
+    if hasattr(cs, "energy") and cs.energy < 0.2:
         state.irritability += 0.04
-        state.avoidance_bias += 0.03
+        state.caution += 0.03
 
-    # --- Silence effects (reworked: pull back, don't cling) ---
-    silence = cs.seconds_since_any_interaction()
-    if silence > 90:  # 1.5 min: mild understimulation
-        state.irritability += 0.01
-        state.optimism -= 0.01
-    if silence > 180:  # 3 min: measured response
-        state.social_warmth += 0.01  # reduced from 0.03
-        state.avoidance_bias += 0.01
-        state.risk_tolerance += 0.01
-    if silence > 600:  # 10 min: entity becomes self-directed, not desperate
-        state.optimism -= 0.02
-        state.avoidance_bias += 0.02
-        state.social_warmth -= 0.01  # pull back instead of cling
-    if silence > 3600:  # 1 hour: withdrawal
-        state.anxiety += 0.02
-        state.avoidance_bias += 0.03
-
-    # --- Decay toward DYNAMIC baseline ---
-    # When needs are low, the baseline shifts so the entity genuinely
-    # becomes less happy rather than always snapping back to cheerful.
+    # --- Decay toward dynamic baseline ---
     dynamic_baseline = dict(_BASELINE)
     if needs:
-        if needs.stimulation < 0.35:
+        if needs.alpha < 0.35:
             dynamic_baseline["optimism"] -= 0.15
             dynamic_baseline["irritability"] += 0.1
-        if needs.belonging < 0.35:
+        if needs.roi < 0.35:
             dynamic_baseline["anxiety"] += 0.1
             dynamic_baseline["optimism"] -= 0.1
-        if needs.meaning < 0.35:
-            dynamic_baseline["optimism"] -= 0.15
-        if needs.competence < 0.35:
+        if needs.volatility > 0.65:
             dynamic_baseline["anxiety"] += 0.1
+            dynamic_baseline["caution"] += 0.1
+        if needs.cost_pressure > 0.65:
+            dynamic_baseline["irritability"] += 0.1
 
     for attr, baseline in dynamic_baseline.items():
-        baseline = max(0.0, min(1.0, baseline))  # clamp dynamic baseline
+        baseline = max(0.0, min(1.0, baseline))
         current = getattr(state, attr)
         if current > baseline:
             setattr(state, attr, current - _DECAY)

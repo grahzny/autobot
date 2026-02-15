@@ -1,4 +1,4 @@
-"""FastAPI server for the Autobot living entity."""
+"""FastAPI server for the Autobot market entity."""
 
 from __future__ import annotations
 
@@ -15,15 +15,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from autobot.identity import Identity
-from autobot.living_engine import LivingEngine, TickResult
-from autobot.heartbeat import heartbeat_loop
+from autobot.living_engine import MarketEngine, MarketTickResult
+from autobot.heartbeat import market_heartbeat_loop
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autobot.server")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="Autobot -- Living Entity", version="0.2.0")
+app = FastAPI(title="Autobot -- Market Entity", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,9 +47,9 @@ def _load_identity() -> Identity:
 
 
 # Global entity -- there is only one
-engine = LivingEngine(identity=_load_identity())
+engine = MarketEngine.from_identity(_load_identity())
 
-# WebSocket connections per person_id
+# WebSocket connections (chris only, but keyed for compatibility)
 ws_connections: dict[str, list[WebSocket]] = {}
 
 # Outgoing message queue (for polling fallback)
@@ -62,7 +62,7 @@ message_queues: dict[str, list[dict[str, Any]]] = {}
 
 @app.on_event("startup")
 async def startup():
-    async def on_tick(result: TickResult):
+    async def on_tick(result: MarketTickResult):
         """Push outgoing messages and thinking updates via WebSocket."""
         if result.outgoing_message and result.target_person_id:
             msg_data = {
@@ -88,32 +88,60 @@ async def startup():
             # Also queue for polling
             message_queues.setdefault(pid, []).append(msg_data)
 
-        # Broadcast thinking update to ALL connected clients
-        if result.thinking:
-            thinking_data = {
-                "type": "thinking_update",
-                "thinking": result.thinking,
-                "decision": result.decision,
-                "tick": result.tick,
-                "mood": engine.emotions.dominant_mood(),
-                "energy": round(engine.state.energy, 2),
-            }
-            for pid, sockets in ws_connections.items():
-                dead = []
-                for ws_conn in sockets:
-                    try:
-                        await ws_conn.send_json(thinking_data)
-                    except Exception:
-                        dead.append(ws_conn)
-                for ws_conn in dead:
-                    sockets.remove(ws_conn)
+        # Broadcast thinking/market update to ALL connected clients
+        update_data = {
+            "type": "thinking_update",
+            "thinking": result.thinking,
+            "decision": result.decision,
+            "tick": result.tick,
+            "mood": engine.emotions.dominant_mood(),
+            "energy": round(engine.state.energy, 2),
+            "capital": round(engine.accountant.operating_capital, 2),
+            "starvation": result.starvation_level,
+        }
 
-    asyncio.create_task(heartbeat_loop(engine, on_tick=on_tick))
-    logger.info("Entity is alive.")
+        # Add trade info if relevant
+        if result.trade_action:
+            update_data["trade_action"] = result.trade_action
+            update_data["trade_ticker"] = result.trade_ticker
+            if result.trade_pnl is not None:
+                update_data["trade_pnl"] = round(result.trade_pnl, 2)
+
+        for pid, sockets in ws_connections.items():
+            dead = []
+            for ws_conn in sockets:
+                try:
+                    await ws_conn.send_json(update_data)
+                except Exception:
+                    dead.append(ws_conn)
+            for ws_conn in dead:
+                sockets.remove(ws_conn)
+
+    async def on_death():
+        """Broadcast death event to all connected clients."""
+        death_data = {
+            "type": "death",
+            "message": "Entity has died. Capital exhausted.",
+            "total_spent": round(engine.accountant.total_spent, 4),
+        }
+        for pid, sockets in ws_connections.items():
+            for ws_conn in sockets:
+                try:
+                    await ws_conn.send_json(death_data)
+                except Exception:
+                    pass
+
+    asyncio.create_task(market_heartbeat_loop(
+        engine, on_tick=on_tick, on_death=on_death,
+    ))
+    logger.info(
+        "Market entity is alive. Capital: $%.2f",
+        engine.accountant.operating_capital,
+    )
 
 
 # ======================================================================
-# REST Endpoints
+# REST Endpoints -- Chat (Chris)
 # ======================================================================
 
 class ConnectRequest(BaseModel):
@@ -131,25 +159,25 @@ async def index():
 
 @app.post("/api/connect")
 async def connect(req: ConnectRequest):
-    """Register a person with the entity."""
-    from uuid import uuid4
-    person_id = str(uuid4())[:8]
-    person = engine.state.get_or_create_person(person_id, req.person_name)
+    """Register Chris (the only human)."""
+    person = engine.state.get_or_create_person("chris", req.person_name)
     return {
-        "person_id": person_id,
+        "person_id": "chris",
         "entity_name": engine.state.name,
         "mood_hint": engine.emotions.dominant_mood(),
+        "capital": round(engine.accountant.operating_capital, 2),
     }
 
 
 @app.post("/api/message")
 async def send_message(req: MessageRequest):
-    """Send a message to the entity."""
-    person = engine.state.get_person(req.person_id)
+    """Send a message to the entity (from Chris)."""
+    person = engine.state.chris
     if not person:
-        return {"error": "Unknown person_id. Call /api/connect first."}
+        engine.state.get_or_create_person("chris", "Chris")
+        person = engine.state.chris
 
-    engine.receive_message(req.person_id, person.name, req.text)
+    engine.receive_message("chris", person.name, req.text)
     return {"received": True}
 
 
@@ -167,9 +195,94 @@ async def poll(person_id: str):
         "entity_state": {
             "mood_hint": mood,
             "energy_hint": energy_hint,
+            "capital": round(engine.accountant.operating_capital, 2),
         },
     }
 
+
+# ======================================================================
+# REST Endpoints -- Market Status
+# ======================================================================
+
+@app.get("/api/market/status")
+async def market_status():
+    """Market session, watchlist, prices."""
+    return {
+        "session": engine.monitor.market_session_label(),
+        "is_market_open": engine.monitor.is_market_open(),
+        "is_sunday": engine.monitor.is_sunday(),
+        "watchlist": {
+            ticker: {
+                "price": entry.last_price,
+                "exchange": entry.exchange,
+                "name": entry.name,
+                "sector": entry.sector,
+            }
+            for ticker, entry in engine.monitor.watchlist.items()
+        },
+    }
+
+
+@app.get("/api/portfolio")
+async def portfolio():
+    """Portfolio positions, P&L, Sharpe, win rate."""
+    prices = engine.state.last_prices
+    return {
+        **engine.portfolio.summary(prices),
+        "positions": [
+            {
+                "ticker": p.ticker,
+                "shares": p.shares,
+                "entry_price": p.entry_price,
+                "current_price": prices.get(p.ticker, p.entry_price),
+                "unrealized_pnl": round(
+                    p.unrealized_pnl(prices.get(p.ticker, p.entry_price)), 2
+                ),
+            }
+            for p in engine.portfolio.open_positions()
+        ],
+        "recent_trades": [
+            {
+                "ticker": t.ticker,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "pnl": round(t.realized_pnl or 0, 2),
+            }
+            for t in engine.portfolio.trade_history[-10:]
+        ],
+    }
+
+
+@app.get("/api/capital")
+async def capital():
+    """Operating capital, total spent, daily budget, is_alive."""
+    return engine.accountant.summary()
+
+
+@app.get("/api/research")
+async def research():
+    """Notes, active theses, post-mortems."""
+    return {
+        **engine.research.summary(),
+        "active_theses": [
+            {
+                "ticker": t.ticker,
+                "content": t.content,
+                "conviction": t.conviction,
+                "timestamp": t.timestamp,
+            }
+            for t in engine.research.active_theses()[-10:]
+        ],
+        "recent_lessons": engine.research.recent_lessons(limit=5),
+        "recent_notes": [
+            n.to_dict() for n in engine.research.notes[-10:]
+        ],
+    }
+
+
+# ======================================================================
+# REST Endpoints -- General Status
+# ======================================================================
 
 @app.get("/api/status")
 async def status():
@@ -178,8 +291,12 @@ async def status():
         "entity_name": engine.state.name,
         "mood": engine.emotions.dominant_mood(),
         "energy": round(engine.state.energy, 2),
-        "people_count": len(engine.state.people),
         "tick": engine.state.tick_count,
+        "capital": round(engine.accountant.operating_capital, 2),
+        "is_alive": engine.accountant.is_alive(),
+        "market_session": engine.monitor.market_session_label(),
+        "open_positions": len(engine.portfolio.open_positions()),
+        "total_trades": len(engine.portfolio.trade_history),
     }
 
 
@@ -189,10 +306,14 @@ async def debug_state():
     return engine.debug_state()
 
 
-@app.get("/api/export/timeline")
-async def export_timeline():
-    """Export the entity's complete session as a chronological timeline."""
-    return engine.export_timeline()
+@app.get("/api/thinking")
+async def thinking():
+    """Recent thinking history."""
+    return {
+        "last_thinking": engine.last_thinking,
+        "last_decision": engine.last_decision,
+        "history": engine.thinking_history[-20:],
+    }
 
 
 # ======================================================================
@@ -201,20 +322,21 @@ async def export_timeline():
 
 @app.websocket("/ws/{person_id}")
 async def websocket_endpoint(websocket: WebSocket, person_id: str):
-    person = engine.state.get_person(person_id)
-    if not person:
-        await websocket.close(code=4001, reason="Unknown person_id")
-        return
+    # For market entity, always treat as Chris
+    if not engine.state.chris:
+        engine.state.get_or_create_person("chris", "Chris")
 
     await websocket.accept()
     ws_connections.setdefault(person_id, []).append(websocket)
-    logger.info("WebSocket connected: %s (%s)", person.name, person_id)
+    logger.info("WebSocket connected: %s", person_id)
 
     # Send current state on connect
     await websocket.send_json({
         "type": "connected",
         "entity_name": engine.state.name,
         "mood_hint": engine.emotions.dominant_mood(),
+        "capital": round(engine.accountant.operating_capital, 2),
+        "market_session": engine.monitor.market_session_label(),
     })
 
     try:
@@ -224,11 +346,13 @@ async def websocket_endpoint(websocket: WebSocket, person_id: str):
             if data.get("type") == "message":
                 text = data.get("text", "").strip()
                 if text:
-                    engine.receive_message(person_id, person.name, text)
+                    engine.receive_message(
+                        "chris", engine.state.chris.name, text,
+                    )
                     await websocket.send_json({"type": "received"})
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected: %s", person.name)
+        logger.info("WebSocket disconnected: %s", person_id)
     except Exception as e:
         logger.exception("WebSocket error: %s", e)
     finally:

@@ -142,3 +142,117 @@ class PredictionEngine:
         if action_type == "proactive":
             base *= 0.7  # proactive is inherently riskier
         return round(max(0.0, min(1.0, base)), 2)
+
+
+# ======================================================================
+# Trade Predictions -- market-specific prediction tracking
+# ======================================================================
+
+
+@dataclass
+class TradePrediction:
+    """A prediction about a trade outcome."""
+
+    id: str = ""
+    ticker: str = ""
+    direction: str = "long"     # "long" or "short"
+    entry_price: float = 0.0
+    target_price: float = 0.0
+    conviction: float = 0.5
+    timeframe: str = ""         # "days", "weeks", "months"
+    created_at: float = 0.0
+    resolved: bool = False
+    actual_exit: float | None = None
+    actual_pnl: float | None = None
+    prediction_error: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.created_at:
+            self.created_at = _time.time()
+
+
+@dataclass
+class TradePredictionTracker:
+    """Tracks trade predictions and calculates accuracy."""
+
+    predictions: list[TradePrediction] = field(default_factory=list)
+    max_history: int = 50
+
+    def register_trade_prediction(
+        self,
+        ticker: str,
+        direction: str,
+        entry_price: float,
+        target_price: float,
+        conviction: float = 0.5,
+        timeframe: str = "",
+    ) -> TradePrediction:
+        """Register a new trade prediction."""
+        pred = TradePrediction(
+            id=f"{ticker}_{int(_time.time())}",
+            ticker=ticker,
+            direction=direction,
+            entry_price=entry_price,
+            target_price=target_price,
+            conviction=conviction,
+            timeframe=timeframe,
+        )
+        self.predictions.append(pred)
+        if len(self.predictions) > self.max_history:
+            self.predictions = self.predictions[-self.max_history:]
+        return pred
+
+    def resolve_trade_prediction(
+        self,
+        ticker: str,
+        actual_exit: float,
+        actual_pnl: float,
+    ) -> float | None:
+        """Resolve a prediction and calculate error.
+
+        Returns the prediction error (0 = perfect, higher = worse).
+        """
+        # Find most recent unresolved prediction for this ticker
+        pred = None
+        for p in reversed(self.predictions):
+            if p.ticker == ticker and not p.resolved:
+                pred = p
+                break
+
+        if pred is None:
+            return None
+
+        pred.resolved = True
+        pred.actual_exit = actual_exit
+        pred.actual_pnl = actual_pnl
+
+        # Prediction error: how far off was the target?
+        if pred.entry_price > 0:
+            expected_return = (pred.target_price - pred.entry_price) / pred.entry_price
+            actual_return = (actual_exit - pred.entry_price) / pred.entry_price
+            pred.prediction_error = abs(expected_return - actual_return)
+        else:
+            pred.prediction_error = 0.0
+
+        return pred.prediction_error
+
+    def direction_accuracy(self) -> float | None:
+        """What fraction of resolved predictions got the direction right?"""
+        resolved = [p for p in self.predictions if p.resolved and p.actual_pnl is not None]
+        if not resolved:
+            return None
+        correct = sum(
+            1 for p in resolved
+            if (p.direction == "long" and p.actual_pnl > 0)
+            or (p.direction == "short" and p.actual_pnl < 0)
+        )
+        return round(correct / len(resolved), 4)
+
+    def average_prediction_error(self) -> float | None:
+        """Average prediction error across resolved trades."""
+        resolved = [p for p in self.predictions if p.prediction_error is not None]
+        if not resolved:
+            return None
+        return round(
+            sum(p.prediction_error for p in resolved) / len(resolved), 4  # type: ignore[misc]
+        )

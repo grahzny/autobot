@@ -110,7 +110,7 @@ class TestNeedsDrivenGeneration:
     def test_low_stimulation_generates_exploration_goal(self):
         cs = ChatState()
         emotions = EmotionalState()
-        needs = NeedsState(stimulation=0.2)
+        needs = NeedsState(alpha=0.2)  # alpha maps to stimulation/meaning
         engine = GoalEngine()
         new_goals = engine.auto_generate(cs, emotions, needs=needs)
         descriptions = [g.description for g in engine.goals]
@@ -119,7 +119,7 @@ class TestNeedsDrivenGeneration:
     def test_low_belonging_generates_connection_goal(self):
         cs = ChatState()
         emotions = EmotionalState()
-        needs = NeedsState(belonging=0.2)
+        needs = NeedsState(roi=0.2)  # roi maps to belonging/competence
         engine = GoalEngine()
         new_goals = engine.auto_generate(cs, emotions, needs=needs)
         descriptions = [g.description for g in engine.goals]

@@ -149,10 +149,10 @@ class TestEmpathyModulation:
 
 class TestBoundaryDetection:
     def test_low_reliability_positive_valence_increases_avoidance(self):
-        state = EmotionalState()
+        state = EmotionalState(caution=0.0)
         affect = AffectState(arousal=0.3, valence=0.5)  # nice surface
         cs = ChatState()
-        initial_avoidance = state.avoidance_bias
+        initial_caution = state.caution
         initial_anxiety = state.anxiety
 
         update_reflective_emotions(
@@ -160,16 +160,16 @@ class TestBoundaryDetection:
             user_context={"state": "calm", "intent": "being_friendly", "reliability": 0.2},
         )
 
-        assert state.avoidance_bias > initial_avoidance
+        assert state.caution > initial_caution
         assert state.anxiety > initial_anxiety
 
 
 class TestVulnerabilityResponse:
     def test_genuine_vulnerability_increases_warmth(self):
         # Compare with and without vulnerability context
-        # Start warmth below baseline so decay doesn't cancel the gain
-        state_with = EmotionalState(social_warmth=0.3)
-        state_without = EmotionalState(social_warmth=0.3)
+        # Start below baseline so decay doesn't cancel the gains
+        state_with = EmotionalState(conviction=0.3, risk_tolerance=0.3)
+        state_without = EmotionalState(conviction=0.3, risk_tolerance=0.3)
         affect = AffectState(arousal=0.2, valence=0.1)
         cs = ChatState()
 
@@ -181,16 +181,16 @@ class TestVulnerabilityResponse:
             state_without, AffectState(arousal=0.2, valence=0.1), cs,
         )
 
-        assert state_with.social_warmth > state_without.social_warmth
+        assert state_with.conviction > state_without.conviction
         assert state_with.risk_tolerance > state_without.risk_tolerance
 
 
 class TestHostilityResponse:
     def test_hostile_user_increases_defenses(self):
-        state = EmotionalState()
+        state = EmotionalState(caution=0.0)
         affect = AffectState(arousal=0.5, valence=-0.3)
         cs = ChatState()
-        initial_avoidance = state.avoidance_bias
+        initial_caution = state.caution
         initial_anxiety = state.anxiety
         initial_irritability = state.irritability
 
@@ -199,22 +199,22 @@ class TestHostilityResponse:
             user_context={"state": "hostile", "intent": "confronting", "reliability": 0.5},
         )
 
-        assert state.avoidance_bias > initial_avoidance
+        assert state.caution > initial_caution
         assert state.anxiety > initial_anxiety
         assert state.irritability > initial_irritability
 
     def test_confronting_intent_alone_triggers_defense(self):
-        state = EmotionalState()
+        state = EmotionalState(caution=0.0)
         affect = AffectState(arousal=0.2, valence=0.0)
         cs = ChatState()
-        initial_avoidance = state.avoidance_bias
+        initial_caution = state.caution
 
         update_reflective_emotions(
             state, affect, cs,
             user_context={"state": "calm", "intent": "confronting", "reliability": 0.7},
         )
 
-        assert state.avoidance_bias > initial_avoidance
+        assert state.caution > initial_caution
 
 
 # ======================================================================
