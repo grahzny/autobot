@@ -1,24 +1,29 @@
-"""FastAPI web server for the Autobot simulation."""
+"""FastAPI server for the Autobot living entity."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from autobot.emotions import AffectState
-from autobot.engine import WorldEngine
-from autobot.llm_agent import decide
-from autobot.observation import build_observation
-from autobot.scenarios import ALL_SCENARIOS
+from autobot.identity import Identity
+from autobot.living_engine import LivingEngine, TickResult
+from autobot.heartbeat import heartbeat_loop
 
-app = FastAPI(title="Autobot — AI World Model", version="0.1.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("autobot.server")
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+app = FastAPI(title="Autobot -- Living Entity", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,217 +31,214 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static files
-STATIC_DIR = Path(__file__).parent / "static"
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# ---- In-memory session store ----
-_sessions: dict[str, dict[str, Any]] = {}
-
-
-class StartRequest(BaseModel):
-    scenario: str
-    use_llm: bool = True
-
-
-class ActionRequest(BaseModel):
-    session_id: str
-    action: dict[str, Any] | None = None
+def _load_identity() -> Identity:
+    """Load identity from env var, well-known paths, or fall back to default."""
+    env_path = os.environ.get("AUTOBOT_IDENTITY")
+    if env_path:
+        logger.info("Loading identity from AUTOBOT_IDENTITY=%s", env_path)
+        return Identity.from_file(env_path)
+    for path in [Path("identity.yaml"), Path("identity.yml"), Path("identity.json")]:
+        if path.exists():
+            logger.info("Loading identity from %s", path)
+            return Identity.from_file(str(path))
+    logger.info("No identity file found, using defaults.")
+    return Identity.default()
 
 
-class StepRequest(BaseModel):
-    session_id: str
-    steps: int = 1
-    use_llm: bool = True
+# Global entity -- there is only one
+engine = LivingEngine(identity=_load_identity())
+
+# WebSocket connections per person_id
+ws_connections: dict[str, list[WebSocket]] = {}
+
+# Outgoing message queue (for polling fallback)
+message_queues: dict[str, list[dict[str, Any]]] = {}
 
 
-# ---- Routes ----
+# ======================================================================
+# Startup
+# ======================================================================
+
+@app.on_event("startup")
+async def startup():
+    async def on_tick(result: TickResult):
+        """Push outgoing messages and thinking updates via WebSocket."""
+        if result.outgoing_message and result.target_person_id:
+            msg_data = {
+                "type": "message",
+                "from": "entity",
+                "text": result.outgoing_message,
+                "mood_hint": engine.emotions.dominant_mood(),
+                "thinking": result.thinking,
+            }
+
+            # Push to WebSocket
+            pid = result.target_person_id
+            if pid in ws_connections:
+                dead = []
+                for ws in ws_connections[pid]:
+                    try:
+                        await ws.send_json(msg_data)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    ws_connections[pid].remove(ws)
+
+            # Also queue for polling
+            message_queues.setdefault(pid, []).append(msg_data)
+
+        # Broadcast thinking update to ALL connected clients
+        if result.thinking:
+            thinking_data = {
+                "type": "thinking_update",
+                "thinking": result.thinking,
+                "decision": result.decision,
+                "tick": result.tick,
+                "mood": engine.emotions.dominant_mood(),
+                "energy": round(engine.state.energy, 2),
+            }
+            for pid, sockets in ws_connections.items():
+                dead = []
+                for ws_conn in sockets:
+                    try:
+                        await ws_conn.send_json(thinking_data)
+                    except Exception:
+                        dead.append(ws_conn)
+                for ws_conn in dead:
+                    sockets.remove(ws_conn)
+
+    asyncio.create_task(heartbeat_loop(engine, on_tick=on_tick))
+    logger.info("Entity is alive.")
+
+
+# ======================================================================
+# REST Endpoints
+# ======================================================================
+
+class ConnectRequest(BaseModel):
+    person_name: str
+
+class MessageRequest(BaseModel):
+    person_id: str
+    text: str
+
 
 @app.get("/")
 async def index():
-    index_path = STATIC_DIR / "index.html"
-    if index_path.exists():
-        return FileResponse(str(index_path))
-    return HTMLResponse("<h1>Autobot</h1><p>Static files not found.</p>")
+    return FileResponse(STATIC_DIR / "index.html")
 
 
-@app.get("/api/scenarios")
-async def list_scenarios():
-    # Check if the openai package is available and LLM endpoint is configured
-    llm_url = os.environ.get("AUTOBOT_LLM_URL", "http://localhost:1234/v1")
-    try:
-        from openai import OpenAI
-        llm_available = True
-    except ImportError:
-        llm_available = False
+@app.post("/api/connect")
+async def connect(req: ConnectRequest):
+    """Register a person with the entity."""
+    from uuid import uuid4
+    person_id = str(uuid4())[:8]
+    person = engine.state.get_or_create_person(person_id, req.person_name)
     return {
-        "scenarios": list(ALL_SCENARIOS.keys()),
-        "llm_available": llm_available,
-        "llm_url": llm_url,
+        "person_id": person_id,
+        "entity_name": engine.state.name,
+        "mood_hint": engine.emotions.dominant_mood(),
     }
 
 
-@app.post("/api/start")
-async def start_simulation(req: StartRequest):
-    if req.scenario not in ALL_SCENARIOS:
-        raise HTTPException(400, f"Unknown scenario: {req.scenario}")
+@app.post("/api/message")
+async def send_message(req: MessageRequest):
+    """Send a message to the entity."""
+    person = engine.state.get_person(req.person_id)
+    if not person:
+        return {"error": "Unknown person_id. Call /api/connect first."}
 
-    engine = ALL_SCENARIOS[req.scenario]()
-    session_id = f"session_{len(_sessions) + 1}"
+    engine.receive_message(req.person_id, person.name, req.text)
+    return {"received": True}
 
-    _sessions[session_id] = {
-        "engine": engine,
-        "use_llm": req.use_llm,
-        "history": [],
-    }
 
-    obs = build_observation(engine.world, [])
+@app.get("/api/poll/{person_id}")
+async def poll(person_id: str):
+    """Poll for new messages from the entity."""
+    messages = message_queues.pop(person_id, [])
+    mood = engine.emotions.dominant_mood()
+    energy = engine.state.energy
+
+    energy_hint = "rested" if energy > 0.6 else "tired" if energy > 0.3 else "exhausted"
+
     return {
-        "session_id": session_id,
-        "observation": obs,
-        "emotions": engine.emotions.to_dict(),
-        "goals": engine.goal_engine.to_prompt_text(engine.emotions),
-        "memories": engine.memory.to_prompt_text(),
-        "npcs": _npc_details(engine),
-        "cycle": 0,
-    }
-
-
-@app.post("/api/step")
-async def step_simulation(req: StepRequest):
-    session = _sessions.get(req.session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    engine: WorldEngine = session["engine"]
-    use_llm = req.use_llm
-    results = []
-
-    for _ in range(req.steps):
-        # Build the observation and agent prompt BEFORE ticking
-        obs = build_observation(engine.world, [])
-        prompt = engine._compose_prompt(obs, AffectState())
-
-        # Agent thinks and decides
-        decision = decide(
-            ws=engine.world,
-            emotions=engine.emotions,
-            affect=AffectState(),
-            goal_engine=engine.goal_engine,
-            memory=engine.memory,
-            observation=obs,
-            agent_prompt=prompt,
-            use_llm=use_llm,
-        )
-
-        # Tick the world with the agent's chosen action
-        result = engine.tick(agent_action=decision.action)
-
-        step_data = _build_step_data(engine, result, decision)
-        results.append(step_data)
-        session["history"].append(step_data)
-
-    return {"steps": results}
-
-
-@app.post("/api/action")
-async def manual_action(req: ActionRequest):
-    """Submit a manual action (override agent's choice)."""
-    session = _sessions.get(req.session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    engine: WorldEngine = session["engine"]
-    action = req.action
-    if not action:
-        raise HTTPException(400, "No action provided")
-
-    result = engine.tick(agent_action=action)
-
-    from autobot.llm_agent import AgentDecision
-    decision = AgentDecision(
-        thinking="[Manual action — player override]",
-        action=action,
-        used_llm=False,
-    )
-
-    step_data = _build_step_data(engine, result, decision)
-    session["history"].append(step_data)
-    return step_data
-
-
-@app.get("/api/session/{session_id}")
-async def get_session(session_id: str):
-    session = _sessions.get(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-    engine: WorldEngine = session["engine"]
-    obs = build_observation(engine.world, [])
-    return {
-        "session_id": session_id,
-        "cycle": engine.cycle_count,
-        "observation": obs,
-        "emotions": engine.emotions.to_dict(),
-        "goals": engine.goal_engine.to_prompt_text(engine.emotions),
-        "memories": engine.memory.to_prompt_text(),
-        "npcs": _npc_details(engine),
-        "history_length": len(session["history"]),
-    }
-
-
-# ---- Helpers ----
-
-def _build_step_data(engine, result, decision):
-    return {
-        "cycle": engine.cycle_count,
-        "time": result.observation["time"],
-        "action": decision.action,
-        "thinking": decision.thinking,
-        "used_llm": decision.used_llm,
-        "observation": result.observation,
-        "events": [_clean_event(e) for e in result.events],
-        "emotions": result.emotions.to_dict(),
-        "affect": {
-            "arousal": round(result.affect.arousal, 3),
-            "valence": round(result.affect.valence, 3),
-            "salience_tags": result.affect.salience_tags,
-            "attention_focus": result.affect.attention_focus,
+        "messages": messages,
+        "entity_state": {
+            "mood_hint": mood,
+            "energy_hint": energy_hint,
         },
-        "goals": engine.goal_engine.to_prompt_text(engine.emotions),
-        "goals_list": [
-            {
-                "id": g.id,
-                "description": g.description,
-                "category": g.category,
-                "priority": g.effective_priority(engine.emotions),
-                "failures": g.failure_count,
-                "completed": g.completed,
-                "abandoned": g.abandoned,
-            }
-            for g in engine.goal_engine.goals
-        ],
-        "memories": engine.memory.to_prompt_text(),
-        "new_episode": result.new_episode,
-        "npcs": _npc_details(engine),
-        "agent_prompt": result.agent_prompt,
     }
 
 
-def _npc_details(engine: WorldEngine) -> list[dict]:
-    return [
-        {
-            "name": npc.name,
-            "trust": round(npc.trust_in_agent, 3),
-            "influence": round(npc.influence_weight, 2),
-            "last_interaction": npc.last_interaction_time,
-        }
-        for npc in engine.world.npcs.values()
-    ]
+@app.get("/api/status")
+async def status():
+    """Quick entity status."""
+    return {
+        "entity_name": engine.state.name,
+        "mood": engine.emotions.dominant_mood(),
+        "energy": round(engine.state.energy, 2),
+        "people_count": len(engine.state.people),
+        "tick": engine.state.tick_count,
+    }
 
 
-def _clean_event(ev: dict) -> dict:
-    cleaned = dict(ev)
-    for key in ("world_time", "day", "hour"):
-        cleaned.pop(key, None)
-    return cleaned
+@app.get("/api/debug/state")
+async def debug_state():
+    """Full internal state dump."""
+    return engine.debug_state()
+
+
+@app.get("/api/export/timeline")
+async def export_timeline():
+    """Export the entity's complete session as a chronological timeline."""
+    return engine.export_timeline()
+
+
+# ======================================================================
+# WebSocket
+# ======================================================================
+
+@app.websocket("/ws/{person_id}")
+async def websocket_endpoint(websocket: WebSocket, person_id: str):
+    person = engine.state.get_person(person_id)
+    if not person:
+        await websocket.close(code=4001, reason="Unknown person_id")
+        return
+
+    await websocket.accept()
+    ws_connections.setdefault(person_id, []).append(websocket)
+    logger.info("WebSocket connected: %s (%s)", person.name, person_id)
+
+    # Send current state on connect
+    await websocket.send_json({
+        "type": "connected",
+        "entity_name": engine.state.name,
+        "mood_hint": engine.emotions.dominant_mood(),
+    })
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+
+            if data.get("type") == "message":
+                text = data.get("text", "").strip()
+                if text:
+                    engine.receive_message(person_id, person.name, text)
+                    await websocket.send_json({"type": "received"})
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected: %s", person.name)
+    except Exception as e:
+        logger.exception("WebSocket error: %s", e)
+    finally:
+        if person_id in ws_connections:
+            if websocket in ws_connections[person_id]:
+                ws_connections[person_id].remove(websocket)
+
+
+# ======================================================================
+# Static files (must be last)
+# ======================================================================
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

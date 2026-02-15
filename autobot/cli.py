@@ -1,60 +1,66 @@
-"""CLI entry point for Autobot world simulation."""
+"""CLI entry point for Autobot -- Living Entity."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from autobot.scenarios import ALL_SCENARIOS
-from autobot.simulation import SimulationConfig, run_simulation
-
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="autobot",
-        description="Autobot — AI World Model: Logic & Language Environment",
+        description="Autobot -- A Living Entity",
     )
-    parser.add_argument(
-        "scenario",
-        choices=list(ALL_SCENARIOS.keys()) + ["all"],
-        help="Which scenario to run (or 'all' for every scenario).",
-    )
-    parser.add_argument(
-        "-c", "--cycles",
+    sub = parser.add_subparsers(dest="command")
+
+    # serve command
+    serve_parser = sub.add_parser("serve", help="Start the Autobot server.")
+    serve_parser.add_argument(
+        "-p", "--port",
         type=int,
-        default=20,
-        help="Max cycles to simulate (default: 20).",
+        default=8000,
+        help="Port to listen on (default: 8000).",
     )
-    parser.add_argument(
-        "-q", "--quiet",
+    serve_parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host to bind to (default: 0.0.0.0).",
+    )
+    serve_parser.add_argument(
+        "--reload",
         action="store_true",
-        help="Suppress per-cycle output.",
+        help="Enable auto-reload for development.",
     )
-    parser.add_argument(
-        "-o", "--output",
+    serve_parser.add_argument(
+        "--identity",
         type=str,
         default=None,
-        help="Write JSON log to this file.",
+        help="Path to identity config file (YAML or JSON).",
     )
 
     args = parser.parse_args(argv)
-    config = SimulationConfig(
-        max_cycles=args.cycles,
-        verbose=not args.quiet,
-        log_file=args.output,
-    )
 
-    if args.scenario == "all":
-        for name, builder in ALL_SCENARIOS.items():
-            print(f"\n{'#' * 70}")
-            print(f"#  SCENARIO: {name}")
-            print(f"{'#' * 70}\n")
-            engine = builder()
-            run_simulation(engine, config)
-            print()
+    if args.command == "serve":
+        try:
+            import uvicorn
+        except ImportError:
+            print("Error: uvicorn is required. Install with: pip install uvicorn[standard]")
+            sys.exit(1)
+
+        import os
+        if args.identity:
+            os.environ["AUTOBOT_IDENTITY"] = args.identity
+
+        print(f"Starting Autobot on http://{args.host}:{args.port}")
+        uvicorn.run(
+            "autobot.server:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+        )
     else:
-        engine = ALL_SCENARIOS[args.scenario]()
-        run_simulation(engine, config)
+        parser.print_help()
 
 
 if __name__ == "__main__":

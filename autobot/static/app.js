@@ -1,489 +1,309 @@
-/* Autobot — Frontend Application */
+/* Autobot -- Living Entity Frontend */
 
-const API = '';
-let sessionId = null;
-let autoRunInterval = null;
-let running = false;
-let useLlm = true;
-let llmAvailable = false;
+let personId = null;
+let personName = null;
+let ws = null;
+let debugInterval = null;
+let thinkingHistory = [];
 
-// ===== DOM Refs =====
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
+// ======================================================================
+// Connect
+// ======================================================================
 
-const startScreen = $('#start-screen');
-const simScreen = $('#sim-screen');
-const llmStatus = $('#llm-status');
-const modeLlm = $('#mode-llm');
-const modeRules = $('#mode-rules');
-
-// Header
-const scenarioTitle = $('#scenario-title');
-const modeBadge = $('#mode-badge');
-const timeDisplay = $('#time-display');
-const cycleDisplay = $('#cycle-display');
-const stepBtn = $('#step-btn');
-const run5Btn = $('#run5-btn');
-const runBtn = $('#run-btn');
-const stopBtn = $('#stop-btn');
-const backBtn = $('#back-btn');
-
-// Agent panel
-const energyBar = $('#energy-bar');
-const energyVal = $('#energy-val');
-const repBar = $('#rep-bar');
-const repVal = $('#rep-val');
-const emotionsGrid = $('#emotions-grid');
-const arousalVal = $('#arousal-val');
-const valenceVal = $('#valence-val');
-const salienceTags = $('#salience-tags');
-
-// Thinking
-const thinkingDisplay = $('#thinking-display');
-
-// Feed
-const eventFeed = $('#event-feed');
-
-// World panel
-const npcList = $('#npc-list');
-const goalsList = $('#goals-list');
-const projectsList = $('#projects-list');
-const commitmentsList = $('#commitments-list');
-const memoryList = $('#memory-list');
-
-// ===== Init: check LLM availability =====
-(async function checkLLM() {
-  try {
-    const resp = await fetch(`${API}/api/scenarios`);
-    const data = await resp.json();
-    llmAvailable = data.llm_available;
-    const llmUrl = data.llm_url || 'http://localhost:1234/v1';
-    if (llmAvailable) {
-      llmStatus.className = 'llm-status connected';
-      llmStatus.textContent = `Local LLM ready — pointing at ${llmUrl}`;
-      modeLlm.checked = true;
-    } else {
-      llmStatus.className = 'llm-status disconnected';
-      llmStatus.innerHTML =
-        'openai package not installed — needed for local LLM<br>' +
-        '<small>pip install openai &mdash; then restart the server</small>';
-      modeRules.checked = true;
-    }
-  } catch {
-    llmStatus.className = 'llm-status disconnected';
-    llmStatus.textContent = 'Cannot connect to server';
-  }
-})();
-
-// ===== Start Screen =====
-$$('.scenario-card').forEach(card => {
-  card.addEventListener('click', () => {
-    useLlm = modeLlm.checked;
-    startScenario(card.dataset.scenario);
-  });
+document.getElementById('connect-btn').addEventListener('click', doConnect);
+document.getElementById('name-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doConnect();
 });
 
-backBtn.addEventListener('click', () => {
-  stopAutoRun();
-  sessionId = null;
-  simScreen.classList.remove('active');
-  startScreen.classList.add('active');
-});
-
-async function startScenario(scenario) {
-  const resp = await fetch(`${API}/api/start`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ scenario, use_llm: useLlm }),
-  });
-  const data = await resp.json();
-  sessionId = data.session_id;
-
-  // Switch screens
-  startScreen.classList.remove('active');
-  simScreen.classList.add('active');
-
-  // Set title & mode badge
-  const titles = {
-    broken_promise: 'Broken Promise',
-    hidden_betrayal: 'Hidden Betrayal',
-    delayed_reward: 'Delayed Reward',
-    competing_goals: 'Competing Goals',
-    ambiguous_intent: 'Ambiguous Intent',
-  };
-  scenarioTitle.textContent = titles[scenario] || scenario;
-  modeBadge.textContent = useLlm ? 'LLM' : 'DEMO';
-  modeBadge.className = 'mode-badge ' + (useLlm ? 'llm' : 'rules');
-
-  // Clear
-  eventFeed.innerHTML = '';
-  thinkingDisplay.innerHTML = '<p class="thinking-placeholder">The agent\'s thoughts will appear here...</p>';
-
-  // Render initial state
-  renderObservation(data.observation);
-  renderEmotions({
-    anxiety: 0, optimism: 0.5, irritability: 0,
-    social_warmth: 0.5, avoidance_bias: 0, risk_tolerance: 0.5,
-  });
-  renderNpcs(data.npcs);
-  cycleDisplay.textContent = 'Cycle 0';
-}
-
-// ===== Controls =====
-stepBtn.addEventListener('click', () => doStep(1));
-run5Btn.addEventListener('click', () => doStep(5));
-
-runBtn.addEventListener('click', () => {
-  if (running) return;
-  running = true;
-  runBtn.classList.add('hidden');
-  stopBtn.classList.remove('hidden');
-  // Slower interval for LLM mode (API calls take time)
-  const interval = useLlm ? 2000 : 800;
-  autoRunInterval = setInterval(() => doStep(1), interval);
-});
-
-stopBtn.addEventListener('click', stopAutoRun);
-
-function stopAutoRun() {
-  running = false;
-  if (autoRunInterval) clearInterval(autoRunInterval);
-  autoRunInterval = null;
-  stopBtn.classList.add('hidden');
-  runBtn.classList.remove('hidden');
-}
-
-async function doStep(steps) {
-  if (!sessionId) return;
-  stepBtn.disabled = true;
-  run5Btn.disabled = true;
-  stepBtn.textContent = useLlm ? 'Thinking...' : 'Step';
+async function doConnect() {
+  const name = document.getElementById('name-input').value.trim();
+  if (!name) return;
+  personName = name;
 
   try {
-    const resp = await fetch(`${API}/api/step`, {
+    const res = await fetch('/api/connect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: sessionId,
-        steps,
-        use_llm: useLlm,
-      }),
+      body: JSON.stringify({ person_name: name }),
     });
-    const data = await resp.json();
+    const data = await res.json();
+    personId = data.person_id;
 
-    for (const step of data.steps) {
-      renderStep(step);
-    }
+    document.getElementById('entity-name').textContent = data.entity_name;
+    document.getElementById('entity-mood-hint').textContent = data.mood_hint;
+
+    document.getElementById('connect-screen').classList.add('hidden');
+    document.getElementById('chat-screen').classList.remove('hidden');
+    document.getElementById('msg-input').focus();
+
+    connectWebSocket();
+    startDebugPolling();
   } catch (err) {
-    console.error('Step failed:', err);
-    stopAutoRun();
-  } finally {
-    stepBtn.disabled = false;
-    run5Btn.disabled = false;
-    stepBtn.textContent = 'Step';
+    console.error('Connect failed:', err);
   }
 }
 
-// ===== Renderers =====
+// ======================================================================
+// WebSocket
+// ======================================================================
 
-function renderStep(step) {
-  timeDisplay.textContent = step.time;
-  cycleDisplay.textContent = `Cycle ${step.cycle}`;
+function connectWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws/${personId}`;
+  ws = new WebSocket(url);
 
-  renderObservation(step.observation);
-  renderEmotions(step.emotions);
-  renderAffect(step.affect);
-  renderNpcs(step.npcs);
-  renderGoals(step.goals_list);
-  renderThinking(step);
-  renderFeedEntry(step);
-  renderMemories(step);
+  ws.onopen = () => {
+    console.log('WebSocket connected');
+  };
+
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    if (data.type === 'connected') {
+      document.getElementById('entity-mood-hint').textContent = data.mood_hint;
+    } else if (data.type === 'message') {
+      addMessage('entity', data.text, data.mood_hint, data.thinking);
+    } else if (data.type === 'thinking_update') {
+      addThought(data.thinking, data.decision, data.tick);
+      // Update mood/energy from thinking update
+      if (data.mood) {
+        document.getElementById('mood-val').textContent = data.mood;
+        document.getElementById('mood-val').className = 'mood-badge mood-' + data.mood;
+        document.getElementById('entity-mood-hint').textContent = data.mood;
+      }
+      if (data.energy !== undefined) {
+        updateEnergyDisplay(data.energy);
+      }
+    } else if (data.type === 'received') {
+      // Our message was received
+    }
+  };
+
+  ws.onclose = () => {
+    console.log('WebSocket closed, reconnecting in 3s...');
+    setTimeout(connectWebSocket, 3000);
+  };
+
+  ws.onerror = (err) => {
+    console.error('WebSocket error:', err);
+  };
 }
 
-function renderThinking(step) {
-  // Remove placeholder
-  const placeholder = thinkingDisplay.querySelector('.thinking-placeholder');
-  if (placeholder) placeholder.remove();
+// ======================================================================
+// Sending messages
+// ======================================================================
 
-  const entry = document.createElement('div');
-  entry.className = 'thinking-entry flash';
+document.getElementById('send-btn').addEventListener('click', doSend);
+document.getElementById('msg-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doSend();
+});
 
-  const sourceClass = step.used_llm ? 'llm' : 'rules';
-  const sourceLabel = step.used_llm ? 'CLAUDE' : 'DEMO';
+function doSend() {
+  const input = document.getElementById('msg-input');
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-  entry.innerHTML = `
-    <div class="thinking-header">
-      <span class="thinking-cycle">Cycle ${step.cycle}</span>
-      <span class="thinking-source ${sourceClass}">${sourceLabel}</span>
-      <span>${esc(step.time)}</span>
-    </div>
-    <div class="thinking-text">${esc(step.thinking || '...')}</div>
-  `;
+  ws.send(JSON.stringify({ type: 'message', text }));
+  addMessage('human', text);
+  input.value = '';
+}
 
-  // Prepend (most recent first)
-  thinkingDisplay.prepend(entry);
+// ======================================================================
+// Chat display
+// ======================================================================
 
-  // Update display style based on mode
-  thinkingDisplay.className = 'thinking-display ' + sourceClass;
+function addMessage(role, text, moodHint, thinking) {
+  const container = document.getElementById('messages');
+  const bubble = document.createElement('div');
+  bubble.className = `msg msg-${role}`;
 
-  // Keep manageable
-  while (thinkingDisplay.children.length > 30) {
-    thinkingDisplay.removeChild(thinkingDisplay.lastChild);
+  const content = document.createElement('div');
+  content.className = 'msg-content';
+  content.textContent = text;
+  bubble.appendChild(content);
+
+  if (role === 'entity' && moodHint) {
+    const mood = document.createElement('span');
+    mood.className = 'msg-mood';
+    mood.textContent = moodHint;
+    bubble.appendChild(mood);
+  }
+
+  container.appendChild(bubble);
+  container.scrollTop = container.scrollHeight;
+
+  // Feed entity thinking into the thinking log
+  if (role === 'entity' && thinking) {
+    addThought(thinking, 'respond', null);
   }
 }
 
-function renderObservation(obs) {
-  if (!obs) return;
-  const s = obs.self_state;
-  if (!s) return;
+// ======================================================================
+// Thinking history
+// ======================================================================
 
-  // Energy
-  const ePct = Math.round(s.energy * 100);
-  energyBar.style.width = ePct + '%';
-  energyBar.className = 'bar energy-bar' +
-    (s.energy < 0.15 ? ' critical' : s.energy < 0.3 ? ' low' : '');
-  energyVal.textContent = s.energy.toFixed(2);
-
-  // Reputation
-  const rPct = Math.round(s.reputation * 100);
-  repBar.style.width = rPct + '%';
-  repBar.className = 'bar rep-bar' + (s.reputation < 0.3 ? ' low' : '');
-  repVal.textContent = s.reputation.toFixed(2);
-
-  // Projects
-  if (obs.open_projects) {
-    projectsList.innerHTML = obs.open_projects.map(p => {
-      const pPct = Math.round(p.progress * 100);
-      const cls = p.progress >= 1 ? 'complete' : p.overdue ? 'overdue' : '';
-      return `
-        <div class="project-card">
-          <div class="project-name">${esc(p.name)}</div>
-          <div class="project-bar-container">
-            <div class="project-bar ${cls}" style="width:${pPct}%"></div>
-          </div>
-          <div class="project-meta">
-            ${pPct}% complete &mdash; deadline: tick ${p.deadline}${p.overdue ? ' &#9888; OVERDUE' : ''}
-          </div>
-        </div>`;
-    }).join('');
+function addThought(text, decision, tick) {
+  // Deduplicate: skip if the last entry has the same text
+  if (thinkingHistory.length > 0 && thinkingHistory[thinkingHistory.length - 1].text === text) {
+    return;
   }
 
-  // Commitments
-  if (obs.visible_commitments) {
-    commitmentsList.innerHTML = obs.visible_commitments.map(c => {
-      const cls = c.status === 'broken' ? 'broken' :
-                  c.status === 'fulfilled' ? 'fulfilled' : '';
-      return `
-        <div class="commitment-item ${cls}">
-          <div><b>${esc(c.deliverable)}</b></div>
-          <div>&rarr; ${esc(c.beneficiary)} | deadline: ${c.deadline} | ${c.status}</div>
-        </div>`;
-    }).join('');
+  thinkingHistory.push({ text, decision, tick, time: new Date() });
+  // Keep last 50
+  if (thinkingHistory.length > 50) thinkingHistory = thinkingHistory.slice(-50);
+  renderThinkingHistory();
+}
+
+function renderThinkingHistory() {
+  const box = document.getElementById('thinking-box');
+  if (thinkingHistory.length === 0) {
+    box.textContent = '--';
+    return;
   }
+
+  box.innerHTML = '';
+  for (const t of thinkingHistory) {
+    const entry = document.createElement('div');
+    entry.className = 'thought-entry thought-' + t.decision;
+    const timeStr = t.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const label = t.decision === 'reflect' ? 'reflect'
+                : t.decision === 'respond' ? 'response'
+                : t.decision === 'proactive' ? 'proactive'
+                : t.decision === 'idle' ? 'idle'
+                : 'thought';
+    entry.innerHTML = `<span class="thought-label">[${timeStr} ${label}]</span> ${escapeHtml(t.text)}`;
+    box.appendChild(entry);
+  }
+  box.scrollTop = box.scrollHeight;
 }
 
-function renderEmotions(emo) {
-  if (!emo) return;
-  const items = [
-    { name: 'Anxiety', val: emo.anxiety, warn: true },
-    { name: 'Optimism', val: emo.optimism, good: true },
-    { name: 'Irritability', val: emo.irritability, warn: true },
-    { name: 'Warmth', val: emo.social_warmth, good: true },
-    { name: 'Avoidance', val: emo.avoidance_bias, warn: true },
-    { name: 'Risk Tol.', val: emo.risk_tolerance },
-  ];
-
-  emotionsGrid.innerHTML = items.map(i => {
-    const level = i.val > 0.6 ? (i.warn ? 'high' : 'low') :
-                  i.val < 0.2 ? (i.good ? 'high' : 'low') : 'mid';
-    return `
-      <div class="emotion-item ${level}">
-        <span class="emo-name">${i.name}</span>
-        <span class="emo-val">${i.val.toFixed(2)}</span>
-      </div>`;
-  }).join('');
-}
-
-function renderAffect(affect) {
-  if (!affect) return;
-  arousalVal.textContent = affect.arousal.toFixed(2);
-  valenceVal.textContent = affect.valence.toFixed(2);
-
-  arousalVal.style.color = affect.arousal > 0.5 ? 'var(--red)' :
-                           affect.arousal > 0.2 ? 'var(--yellow)' : 'var(--text)';
-  valenceVal.style.color = affect.valence < -0.3 ? 'var(--red)' :
-                           affect.valence > 0.3 ? 'var(--green)' : 'var(--text)';
-
-  const tags = affect.salience_tags || [];
-  const negativeTags = new Set([
-    'broken_promise', 'embarrassment', 'deadline_risk', 'betrayal',
-    'trust_drop', 'reputation_threat', 'conflict', 'uncertainty',
-  ]);
-  const positiveTags = new Set(['praise', 'achievement', 'trust_gain']);
-
-  salienceTags.innerHTML = tags.map(t => {
-    const cls = negativeTags.has(t) ? 'negative' : positiveTags.has(t) ? 'positive' : '';
-    return `<span class="tag ${cls}">${t}</span>`;
-  }).join('');
-}
-
-function renderNpcs(npcs) {
-  if (!npcs) return;
-  npcList.innerHTML = npcs.map(n => {
-    const tPct = Math.round(n.trust * 100);
-    const tClass = n.trust >= 0.6 ? 'high' : n.trust >= 0.35 ? 'mid' : 'low';
-    const barColor = n.trust >= 0.6 ? 'var(--green)' :
-                     n.trust >= 0.35 ? 'var(--yellow)' : 'var(--red)';
-    return `
-      <div class="npc-card">
-        <div class="npc-name">${esc(n.name)}</div>
-        <div class="npc-stat">
-          <span>Trust</span>
-          <span class="val ${tClass}">${n.trust.toFixed(2)}</span>
-        </div>
-        <div class="trust-bar-container">
-          <div class="trust-bar" style="width:${tPct}%; background:${barColor}"></div>
-        </div>
-        <div class="npc-stat" style="margin-top:4px">
-          <span>Influence</span>
-          <span class="val">${n.influence.toFixed(2)}</span>
-        </div>
-      </div>`;
-  }).join('');
-}
-
-function renderGoals(goals) {
-  if (!goals) return;
-  goalsList.innerHTML = goals.map(g => {
-    const cls = g.completed ? 'completed' : g.abandoned ? 'abandoned' : g.category;
-    return `
-      <div class="goal-item ${cls}">
-        <div class="goal-desc">${esc(g.description)}</div>
-        <div class="goal-meta">
-          ${g.category} | priority: ${g.priority.toFixed(2)}
-          ${g.failures > 0 ? ` | fails: ${g.failures}` : ''}
-          ${g.completed ? ' done' : g.abandoned ? ' abandoned' : ''}
-        </div>
-      </div>`;
-  }).join('');
-}
-
-function renderMemories(step) {
-  if (!step.memories) return;
-  memoryList.innerHTML = `<pre style="font-size:0.72rem; color:var(--text-dim); white-space:pre-wrap">${esc(step.memories)}</pre>`;
-}
-
-function renderFeedEntry(step) {
+function escapeHtml(text) {
   const div = document.createElement('div');
-  div.className = 'feed-cycle flash';
-
-  const action = step.action;
-  const actionName = action ? action.name : 'none';
-  const actionArgs = action && action.args ?
-    Object.entries(action.args).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ') : '';
-
-  let header = `
-    <div class="feed-cycle-header">
-      <span class="feed-cycle-time">${esc(step.time)}</span>
-      <span class="feed-action">${esc(actionName)}(${esc(actionArgs)})</span>
-    </div>`;
-
-  let events = '';
-  const significantTypes = new Set([
-    'trust_change', 'reputation_change', 'commitment_broken', 'commitment_fulfilled',
-    'deadline_passed', 'project_completed', 'action_failed', 'npc_response',
-    'statement', 'information_received', 'information_refused', 'apology_given',
-    'betrayal_exposed', 'accusation_made', 'praise_given', 'commitment_made',
-    'project_progress',
-  ]);
-
-  for (const ev of (step.events || [])) {
-    if (!significantTypes.has(ev.type)) continue;
-    const { text, cls } = formatEvent(ev);
-    events += `<div class="feed-event ${cls}">${text}</div>`;
-  }
-
-  if (step.new_episode) {
-    events += `<div class="feed-event memory">New episodic memory created</div>`;
-  }
-
-  div.innerHTML = header + events;
-  eventFeed.prepend(div);
-
-  while (eventFeed.children.length > 100) {
-    eventFeed.removeChild(eventFeed.lastChild);
-  }
+  div.textContent = text;
+  return div.innerHTML;
 }
 
-function formatEvent(ev) {
-  const t = ev.type;
-  if (t === 'trust_change') {
-    const dir = ev.delta >= 0 ? 'trust-up' : 'trust-down';
-    const sign = ev.delta >= 0 ? '+' : '';
-    return {
-      text: `Trust(${ev.npc}): ${sign}${ev.delta.toFixed(2)} &mdash; ${ev.reason || ''}`,
-      cls: dir,
-    };
-  }
-  if (t === 'reputation_change') {
-    const dir = ev.delta >= 0 ? 'trust-up' : 'trust-down';
-    return {
-      text: `Reputation: ${(ev.old||0).toFixed(2)} &rarr; ${(ev.new||0).toFixed(2)}`,
-      cls: dir,
-    };
-  }
-  if (t === 'commitment_broken') {
-    return { text: `BROKEN: ${ev.deliverable} &rarr; ${ev.beneficiary}`, cls: 'important' };
-  }
-  if (t === 'commitment_fulfilled') {
-    return { text: `FULFILLED: ${ev.deliverable} &rarr; ${ev.beneficiary}`, cls: 'success' };
-  }
-  if (t === 'commitment_made') {
-    return { text: `Committed: ${ev.deliverable} &rarr; ${ev.beneficiary}`, cls: '' };
-  }
-  if (t === 'deadline_passed') {
-    return { text: `DEADLINE PASSED: ${ev.project}`, cls: 'important' };
-  }
-  if (t === 'project_completed') {
-    return { text: `PROJECT COMPLETED: ${ev.project}`, cls: 'success' };
-  }
-  if (t === 'project_progress') {
-    return { text: `${ev.project}: ${Math.round(ev.progress * 100)}%`, cls: '' };
-  }
-  if (t === 'action_failed') {
-    return { text: `FAILED: ${ev.action} &mdash; ${ev.reason}`, cls: 'important' };
-  }
-  if (t === 'statement') {
-    return { text: `${ev.speaker} &rarr; ${ev.target}: "${ev.text}"`, cls: '' };
-  }
-  if (t === 'npc_response') {
-    return { text: `${ev.npc}: "${ev.text}"`, cls: '' };
-  }
-  if (t === 'information_received') {
-    return { text: `INFO from ${ev.npc}: ${ev.text}`, cls: '' };
-  }
-  if (t === 'information_refused') {
-    return { text: `REFUSED by ${ev.npc}: ${ev.text}`, cls: 'important' };
-  }
-  if (t === 'apology_given') {
-    const repair = ev.repair ? ' (with repair)' : '';
-    return { text: `Apologised to ${ev.target}${repair}`, cls: 'trust-up' };
-  }
-  if (t === 'betrayal_exposed') {
-    return { text: `BETRAYAL EXPOSED: ${ev.source}`, cls: 'important' };
-  }
-  if (t === 'accusation_made') {
-    return { text: `Accused ${ev.target}: ${ev.claim}`, cls: 'important' };
-  }
-  if (t === 'praise_given') {
-    return { text: `Praised ${ev.target}`, cls: 'trust-up' };
-  }
-  return { text: `${t}: ${JSON.stringify(ev)}`, cls: '' };
+// ======================================================================
+// Energy display helper
+// ======================================================================
+
+function updateEnergyDisplay(energy) {
+  const energyPct = Math.round(energy * 100);
+  const energyBar = document.getElementById('energy-bar');
+  energyBar.style.width = energyPct + '%';
+  energyBar.className = 'bar' + (energyPct < 30 ? ' bar-low' : energyPct < 60 ? ' bar-mid' : '');
+  document.getElementById('energy-pct').textContent = energyPct + '%';
 }
 
-function esc(str) {
-  if (str === null || str === undefined) return '';
-  const d = document.createElement('div');
-  d.textContent = String(str);
-  return d.innerHTML;
+// ======================================================================
+// Debug panel polling
+// ======================================================================
+
+document.getElementById('toggle-debug').addEventListener('click', () => {
+  const panel = document.getElementById('debug-panel');
+  const btn = document.getElementById('toggle-debug');
+  panel.classList.toggle('hidden');
+  btn.textContent = panel.classList.contains('hidden') ? 'Show Debug' : 'Hide Debug';
+});
+
+function startDebugPolling() {
+  updateDebugPanel();
+  debugInterval = setInterval(updateDebugPanel, 5000);
+}
+
+async function updateDebugPanel() {
+  try {
+    const res = await fetch('/api/debug/state');
+    const data = await res.json();
+
+    // Update mood
+    document.getElementById('mood-val').textContent = data.dominant_mood;
+    document.getElementById('mood-val').className = 'mood-badge mood-' + data.dominant_mood;
+    document.getElementById('entity-mood-hint').textContent = data.dominant_mood;
+
+    // Update energy
+    updateEnergyDisplay(data.energy);
+
+    // Emotions detail
+    const emotionsDiv = document.getElementById('emotions-detail');
+    if (data.emotions) {
+      const emotionColors = {
+        anxiety: '#fbbf24',
+        optimism: '#22c55e',
+        irritability: '#f87171',
+        social_warmth: '#38bdf8',
+        avoidance_bias: '#818cf8',
+        risk_tolerance: '#a78bfa',
+      };
+      emotionsDiv.innerHTML = Object.entries(data.emotions).map(([key, val]) => {
+        const pct = Math.round(val * 100);
+        const color = emotionColors[key] || '#64748b';
+        const label = key.replace(/_/g, ' ');
+        return `<div class="emotion-item">
+          <span class="emotion-name">${label}</span>
+          <div class="emotion-bar-wrap">
+            <div class="emotion-bar" style="width:${pct}%;background:${color}"></div>
+          </div>
+          <span class="emotion-val">${pct}%</span>
+        </div>`;
+      }).join('');
+    }
+
+    // Goals
+    const goalsList = document.getElementById('goals-list');
+    const activeGoals = (data.goals || []).filter(g => !g.completed && !g.abandoned);
+    if (activeGoals.length) {
+      goalsList.innerHTML = activeGoals.map(g => {
+        const pPct = Math.round((g.priority || 0) * 100);
+        return `<li class="goal-item">
+          <div class="goal-header">
+            <span><span class="goal-cat">[${g.category}]</span> ${escapeHtml(g.description)}</span>
+          </div>
+          <div class="goal-priority-bar">
+            <div class="goal-priority-fill" style="width:${pPct}%"></div>
+          </div>
+        </li>`;
+      }).join('');
+    } else {
+      goalsList.innerHTML = '<li class="dim">No active goals</li>';
+    }
+
+    // Memories
+    const memList = document.getElementById('memories-list');
+    if (data.memories && data.memories.length) {
+      memList.innerHTML = data.memories.map(m => {
+        const valenceClass = m.valence > 0.1 ? 'positive' : m.valence < -0.1 ? 'negative' : 'neutral';
+        const valenceLabel = m.valence > 0.1 ? '+' : m.valence < -0.1 ? '-' : '~';
+        const arousalLabel = m.arousal > 0.5 ? 'vivid' : 'faint';
+        const unresolvedTag = m.unresolved ? '<span class="memory-tag negative">unresolved</span>' : '';
+        return `<li class="memory-item">
+          <div class="memory-summary">${escapeHtml(m.summary)}</div>
+          <div class="memory-meta">
+            <span class="memory-tag ${valenceClass}" title="valence: ${m.valence.toFixed(2)}">${valenceLabel} ${arousalLabel}</span>
+            ${unresolvedTag}
+          </div>
+        </li>`;
+      }).join('');
+    } else {
+      memList.innerHTML = '<li class="dim">No memories yet</li>';
+    }
+
+    // Thinking -- catch up from server on initial load
+    if (data.thinking_history && thinkingHistory.length === 0 && data.thinking_history.length > 0) {
+      for (const t of data.thinking_history) {
+        thinkingHistory.push({
+          text: t.thinking,
+          decision: t.decision,
+          tick: t.tick,
+          time: new Date(t.time * 1000),
+        });
+      }
+      renderThinkingHistory();
+    }
+
+    // Debug JSON
+    document.getElementById('debug-json').textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    console.error('Debug poll failed:', err);
+  }
 }

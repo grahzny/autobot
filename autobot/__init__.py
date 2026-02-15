@@ -1,1 +1,1 @@
-"""Autobot — AI World Model: Logic & Language Environment."""
+"""Autobot -- A Living Entity."""

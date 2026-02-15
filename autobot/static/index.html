@@ -3,146 +3,81 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Autobot — AI World Model</title>
+  <title>Autobot</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div id="app">
-    <!-- Start Screen -->
-    <div id="start-screen" class="screen active">
-      <div class="start-container">
-        <h1 class="logo">AUTOBOT</h1>
-        <p class="subtitle">AI World Model — Logic &amp; Language Environment</p>
 
-        <div id="llm-status" class="llm-status"></div>
-
-        <div class="scenario-grid">
-          <button class="scenario-card" data-scenario="broken_promise">
-            <span class="scenario-icon">💔</span>
-            <span class="scenario-name">Broken Promise</span>
-            <span class="scenario-desc">Missed deadline triggers trust repair</span>
-          </button>
-          <button class="scenario-card" data-scenario="hidden_betrayal">
-            <span class="scenario-icon">🗡️</span>
-            <span class="scenario-name">Hidden Betrayal</span>
-            <span class="scenario-desc">NPC spreads misinformation secretly</span>
-          </button>
-          <button class="scenario-card" data-scenario="delayed_reward">
-            <span class="scenario-icon">⏳</span>
-            <span class="scenario-name">Delayed Reward</span>
-            <span class="scenario-desc">Short-term gain vs long-term trust</span>
-          </button>
-          <button class="scenario-card" data-scenario="competing_goals">
-            <span class="scenario-icon">⚖️</span>
-            <span class="scenario-name">Competing Goals</span>
-            <span class="scenario-desc">Low energy vs reputation at risk</span>
-          </button>
-          <button class="scenario-card" data-scenario="ambiguous_intent">
-            <span class="scenario-icon">❓</span>
-            <span class="scenario-name">Ambiguous Intent</span>
-            <span class="scenario-desc">Vague NPC statement demands interpretation</span>
-          </button>
-        </div>
-        <div class="start-options">
-          <label class="mode-selector">
-            <input type="radio" name="agent-mode" value="llm" id="mode-llm" checked>
-            <span class="mode-label">
-              <b>Local LLM Brain</b>
-              <small>Real thinking via LM Studio — chain-of-thought reasoning, interprets events</small>
-            </span>
-          </label>
-          <label class="mode-selector">
-            <input type="radio" name="agent-mode" value="rules" id="mode-rules">
-            <span class="mode-label">
-              <b>Demo Mode (Rule-Based)</b>
-              <small>No LLM needed — deterministic policy with synthetic thoughts</small>
-            </span>
-          </label>
-        </div>
-      </div>
+  <!-- Connect screen -->
+  <div id="connect-screen" class="screen">
+    <div class="connect-box">
+      <h1>Autobot</h1>
+      <p class="subtitle">A living entity</p>
+      <input type="text" id="name-input" placeholder="Enter your name" autocomplete="off">
+      <button id="connect-btn">Connect</button>
     </div>
+  </div>
 
-    <!-- Simulation Screen -->
-    <div id="sim-screen" class="screen">
-      <header class="sim-header">
-        <div class="header-left">
-          <button id="back-btn" class="btn-icon" title="Back to scenarios">&#8592;</button>
-          <h2 id="scenario-title"></h2>
-          <span id="mode-badge" class="mode-badge">LLM</span>
+  <!-- Chat screen -->
+  <div id="chat-screen" class="screen hidden">
+    <div class="layout">
+
+      <!-- Left: Entity's Mind -->
+      <aside id="mind-panel" class="panel">
+        <h2>Entity's Mind</h2>
+
+        <div class="mind-card">
+          <label>Mood</label>
+          <span id="mood-val" class="mood-badge">--</span>
         </div>
-        <div class="header-center">
-          <span id="time-display" class="time-badge">Day 1, 08:00</span>
-          <span id="cycle-display" class="cycle-badge">Cycle 0</span>
+
+        <div class="mind-card">
+          <label>Energy</label>
+          <div class="energy-row">
+            <div class="bar-wrap"><div id="energy-bar" class="bar" style="width:100%"></div></div>
+            <span id="energy-pct" class="energy-pct">100%</span>
+          </div>
         </div>
-        <div class="header-right">
-          <button id="step-btn" class="btn primary">Step</button>
-          <button id="run5-btn" class="btn">Run 5</button>
-          <button id="run-btn" class="btn">Auto-Run</button>
-          <button id="stop-btn" class="btn danger hidden">Stop</button>
+
+        <div class="mind-card">
+          <label>Emotions</label>
+          <div id="emotions-detail" class="emotions-detail">--</div>
         </div>
-      </header>
 
-      <main class="sim-body">
-        <!-- Left Column: Agent State -->
-        <section class="panel agent-panel">
-          <h3>Agent</h3>
-          <div class="stat-group">
-            <div class="stat-row">
-              <span class="stat-label">Energy</span>
-              <div class="bar-container">
-                <div id="energy-bar" class="bar energy-bar" style="width:100%"></div>
-              </div>
-              <span id="energy-val" class="stat-val">1.00</span>
-            </div>
-            <div class="stat-row">
-              <span class="stat-label">Reputation</span>
-              <div class="bar-container">
-                <div id="rep-bar" class="bar rep-bar" style="width:50%"></div>
-              </div>
-              <span id="rep-val" class="stat-val">0.50</span>
-            </div>
-          </div>
+        <div class="mind-card mind-card-thinking">
+          <label>Thinking</label>
+          <div id="thinking-box" class="thinking-box">--</div>
+        </div>
 
-          <h4>Emotions</h4>
-          <div id="emotions-grid" class="emotions-grid"></div>
+        <div class="mind-card">
+          <label>Goals</label>
+          <ul id="goals-list" class="goal-list"><li class="dim">--</li></ul>
+        </div>
 
-          <h4>Fast Affect</h4>
-          <div id="affect-display" class="affect-display">
-            <span class="affect-item">Arousal: <b id="arousal-val">0.00</b></span>
-            <span class="affect-item">Valence: <b id="valence-val">0.00</b></span>
-          </div>
-          <div id="salience-tags" class="tag-list"></div>
-        </section>
+        <div class="mind-card">
+          <label>Memories</label>
+          <ul id="memories-list" class="memory-list"><li class="dim">--</li></ul>
+        </div>
 
-        <!-- Center Column: Thinking + Event Feed -->
-        <section class="panel feed-panel">
-          <h3>Agent's Inner Monologue</h3>
-          <div id="thinking-display" class="thinking-display">
-            <p class="thinking-placeholder">The agent's thoughts will appear here...</p>
-          </div>
+        <button id="toggle-debug" class="small-btn">Show Debug</button>
+        <div id="debug-panel" class="debug-panel hidden">
+          <pre id="debug-json">{}</pre>
+        </div>
+      </aside>
 
-          <h3>Event Feed</h3>
-          <div id="event-feed" class="event-feed"></div>
-        </section>
-
-        <!-- Right Column: World State -->
-        <section class="panel world-panel">
-          <h3>NPCs</h3>
-          <div id="npc-list" class="npc-list"></div>
-
-          <h3>Goals</h3>
-          <div id="goals-list" class="goals-list"></div>
-
-          <h3>Projects</h3>
-          <div id="projects-list" class="projects-list"></div>
-
-          <h3>Commitments</h3>
-          <div id="commitments-list" class="commitments-list"></div>
-
-          <h3>Memory</h3>
-          <div id="memory-list" class="memory-list"></div>
-        </section>
+      <!-- Center: Chat -->
+      <main class="chat-panel">
+        <div class="chat-header">
+          <span id="entity-name">Autobot</span>
+          <span id="entity-mood-hint" class="mood-hint"></span>
+        </div>
+        <div id="messages" class="messages"></div>
+        <div class="input-area">
+          <input type="text" id="msg-input" placeholder="Say something..." autocomplete="off">
+          <button id="send-btn">Send</button>
+        </div>
       </main>
+
     </div>
   </div>
 
